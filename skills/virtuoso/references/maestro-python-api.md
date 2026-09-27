@@ -52,6 +52,36 @@ session = client.maestro.open_session("PLAYGROUND_AMP", "TB_AMP_5T_D2S_DC_AC")
 client.maestro.close_session(session)
 ```
 
+### Preserve simulation histories
+
+Maestro normally retains only a bounded number of recent histories. Lock an
+important history to prevent its setup details and simulation results from
+being automatically deleted:
+
+| Python | SKILL | Description |
+|--------|-------|-------------|
+| `client.maestro.list_histories(session)` | `axlGetHistory` | List exact names and the lock/current state |
+| `client.maestro.get_history(history, session=session)` | `axlGetHistoryEntry` | Read one exact history |
+| `client.maestro.set_history_lock(history, locked, session=session)` | `maeSetHistoryLock` | Set and verify an explicit lock state |
+| `client.maestro.lock_history(history, session=session)` | `maeSetHistoryLock` | Idempotently lock one history |
+| `client.maestro.unlock_history(history, session=session)` | `maeSetHistoryLock` | Idempotently unlock one history |
+
+```python
+histories = client.maestro.list_histories(session)
+for history in histories:
+    print(history.name, history.locked, history.current)
+
+result = client.maestro.lock_history("Interactive.7", session=session)
+# Later, when retention is no longer required:
+client.maestro.unlock_history("Interactive.7", session=session)
+```
+
+All operations require an explicit session and exact history name. Lock and
+unlock are idempotent, use `maeSetHistoryLock`, and verify the database state
+after the mutation. A timeout or connection interruption is never retried; if
+one read-back cannot confirm the requested state,
+`MaestroHistoryOutcomeUnknown` is raised.
+
 **`timeout` kwarg** (`open_gui_session` / `close_gui_session` /
 `purge_maestro_cellviews`): bounds each blocking SKILL call in the
 helper. Default 60s — generous enough for cold maestro view opens
