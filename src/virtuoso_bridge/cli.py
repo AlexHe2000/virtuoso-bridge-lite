@@ -1745,9 +1745,129 @@ def cli_screenshot() -> int:
     return 0
 
 
+def cli_sos(*, action: str, lib: str, cell: str, view: str,
+            message: str | None = None, dry_run: bool = False,
+            timeout: float = 60, soscmd: str | None = None,
+            receipt: str | None = None, json_output: bool = False) -> int:
+    """Run one explicit SOS cellview operation."""
+    import json
+    import sys
+    from contextlib import redirect_stdout
+
+    from virtuoso_bridge import VirtuosoClient
+
+    options = {"timeout": timeout}
+    if soscmd is not None:
+        options["soscmd"] = soscmd
+    previous = None
+    reconciliation = None
+    if action == "reconcile":
+        if receipt is None:
+            raise ValueError("SOS reconcile requires --receipt")
+        previous = json.loads(Path(receipt).read_text(encoding="utf-8-sig"))
+        from virtuoso_bridge.virtuoso.sos.diagnostics import validate_receipt
+
+        reconciliation = validate_receipt(lib, cell, view, previous, timeout)
+
+    with redirect_stdout(sys.stderr):
+        try:
+            client = VirtuosoClient.from_env(profile=_get_cli_profile())
+        except Exception as exc:
+            if action != "reconcile" or not isinstance(previous, dict):
+                raise
+            operation, target, _before = reconciliation
+            payload = {
+                "ok": False,
+                "action": "reconcile",
+                "outcome": "unknown",
+                "operation": operation,
+                "assessment": "unavailable",
+                "operation_confirmed": False,
+                "target": target,
+                "diagnostics": [
+                    f"Bridge connection unavailable: {exc}",
+                    "No operation was retried; the original result remains unknown.",
+                ],
+            }
+        else:
+            if action == "status":
+                payload = client.sos.status_cellview(lib, cell, view, **options).to_dict()
+            elif action == "co":
+                payload = client.sos.checkout_cellview(
+                    lib, cell, view, dry_run=dry_run, **options,
+                ).to_dict()
+            elif action in {"ci", "register"}:
+                operation = (
+                    client.sos.register_cellview if action == "register"
+                    else client.sos.checkin_cellview
+                )
+                payload = operation(
+                    lib, cell, view, message=message or "", dry_run=dry_run, **options,
+                ).to_dict()
+            elif action == "doctor":
+                payload = client.sos.diagnose_cellview(lib, cell, view, **options)
+            else:
+                payload = client.sos.reconcile_cellview(
+                    lib, cell, view, receipt=previous, **options,
+                )
+
+    if json_output:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    else:
+        _print_sos_result(payload, fallback=(lib, cell, view))
+    outcome = payload.get("outcome")
+    if outcome in {"success", "noop", "dry_run"}:
+        return 0
+    if outcome == "unknown":
+        return 3
+    return 1
+
+
+def _print_sos_result(payload: dict, *, fallback: tuple[str, str, str] = ("", "", "")) -> None:
+    target = payload.get("target") or {}
+    lib, cell, view = fallback
+    print(f"{payload.get('action', 'sos')}: {payload.get('outcome', 'unknown')}")
+    print(f"target: {target.get('lib', lib)}/{target.get('cell', cell)}/{target.get('view', view)}")
+    if target.get("workarea"):
+        print(f"workarea: {target['workarea']}")
+    before = payload.get("before") or {}
+    if before:
+        state_label = "checked out" if before.get("state") == "O" else before.get("state")
+        print(
+            "state: "
+            f"{state_label} revision={before.get('revision')} "
+            f"change={before.get('change')} lock={before.get('lock')}"
+        )
+    for diagnostic in payload.get("diagnostics") or []:
+        print(f"diagnostic: {diagnostic}")
+
+
+_print_result = _print_sos_result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="virtuoso-bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    sp_sos = subparsers.add_parser("sos", help="Operate on one SOS-managed cellview")
+    sos_actions = sp_sos.add_subparsers(dest="sos_action", required=True)
+    for action in ("status", "co", "ci", "register", "doctor", "reconcile"):
+        sub = sos_actions.add_parser(action)
+        sub.add_argument("lib")
+        sub.add_argument("cell")
+        sub.add_argument("view")
+        sub.add_argument("-p", "--profile", default=None, help="Connection profile")
+        sub.add_argument("--env", default=None, help="Explicit .env file path")
+        sub.add_argument("--json", action="store_true", help="Output structured JSON")
+        sub.add_argument("--timeout", type=float, default=60)
+        sub.add_argument("--soscmd", default=None,
+                         help="SOS executable or site wrapper on the GUI host")
+        if action in {"co", "ci", "register"}:
+            sub.add_argument("--dry-run", action="store_true")
+        if action in {"ci", "register"}:
+            sub.add_argument("-m", "--message", required=True)
+        if action == "reconcile":
+            sub.add_argument("--receipt", required=True,
+                             help="Prior unknown SOS JSON result")
     sp_init = subparsers.add_parser("init", help="Create a starter .env")
     sp_init.add_argument(
         "remote", nargs="?", default=None,
@@ -2103,7 +2223,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _CLI_PROFILE[0] = None
-    set_runtime_env_file(getattr(args, "env", None))
+    if args.command == "sos" and getattr(args, "json", False):
+        import sys
+        from contextlib import redirect_stdout
+
+        with redirect_stdout(sys.stderr):
+            set_runtime_env_file(getattr(args, "env", None))
+    else:
+        set_runtime_env_file(getattr(args, "env", None))
     if getattr(args, "bind_venv", False):
         profile_arg = getattr(args, "profile", None)
         if not profile_arg:
@@ -2132,6 +2259,18 @@ def main(argv: list[str] | None = None) -> int:
         "restart": cli_restart,
         "status": cli_status,
         "license": cli_license,
+        "sos": lambda: cli_sos(
+            action=getattr(args, "sos_action"),
+            lib=getattr(args, "lib"),
+            cell=getattr(args, "cell"),
+            view=getattr(args, "view"),
+            message=getattr(args, "message", None),
+            dry_run=getattr(args, "dry_run", False),
+            timeout=getattr(args, "timeout", 60),
+            soscmd=getattr(args, "soscmd", None),
+            receipt=getattr(args, "receipt", None),
+            json_output=getattr(args, "json", False),
+        ),
         "load": lambda: cli_load(
             file=getattr(args, "file"),
             timeout=getattr(args, "timeout", 60),

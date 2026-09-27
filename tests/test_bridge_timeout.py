@@ -206,3 +206,27 @@ def test_execute_skill_preserves_successful_jump_host_retry(
     assert result.execution_time == pytest.approx(0.55)
     assert clock.sleeps == [0.2]
     assert len(factory.created) == 3
+
+
+def test_execute_skill_can_disable_connect_retry_for_non_idempotent_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    refused = _FakeSocket(
+        clock,
+        connect_error=ConnectionRefusedError(errno.ECONNREFUSED, "refused"),
+    )
+    factory = _SocketFactory([refused])
+    _use_fake_network(monkeypatch, clock, factory)
+
+    result = VirtuosoClient().execute_skill(
+        "nonIdempotentWrite()", timeout=1.0, retry_connect=False,
+    )
+
+    assert result.status == ExecutionStatus.ERROR
+    assert result.errors == [
+        "Connection refused to 127.0.0.1:65432. "
+        "Ensure the RAMIC Bridge daemon is running in Virtuoso."
+    ]
+    assert clock.sleeps == []
+    assert len(factory.created) == 1

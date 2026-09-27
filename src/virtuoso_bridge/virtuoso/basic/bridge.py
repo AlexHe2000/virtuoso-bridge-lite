@@ -129,8 +129,10 @@ class VirtuosoClient(VirtuosoInterface):
         # until this client instance is constructed and module initialization
         # is complete.
         from virtuoso_bridge.virtuoso.maestro.ops import MaestroOps
+        from virtuoso_bridge.virtuoso.sos import SOSOps
 
         self.maestro = MaestroOps(self)
+        self.sos = SOSOps(self)
         self._il_upload_cache: dict[str, tuple[str, str]] = {}
         # For connect retry when jump host adds latency
         self._has_jump_host = (
@@ -287,6 +289,11 @@ class VirtuosoClient(VirtuosoInterface):
             return self._tunnel.gui_runner
         return getattr(self._tunnel, '_ssh_runner', None)
 
+    @property
+    def gui_runner(self):
+        """SSH runner for files and tools located on the Virtuoso GUI host."""
+        return self.docs_runner
+
     @staticmethod
     def _is_local_host_name(host: str | None) -> bool:
         return (host or "").strip().lower() in ("localhost", "127.0.0.1", "::1")
@@ -442,14 +449,20 @@ class VirtuosoClient(VirtuosoInterface):
         self,
         skill_code: str,
         timeout: Optional[float] = None,
+        *,
+        retry_connect: bool = True,
     ) -> VirtuosoResult:
-        """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon."""
+        """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon.
+
+        Set ``retry_connect=False`` for non-idempotent operations that must
+        never be resent after a connection failure.
+        """
         effective_timeout = timeout if timeout is not None else self._timeout
 
         start_time = time.monotonic()
         deadline = start_time + effective_timeout
         connect_deadline = start_time
-        if self._has_jump_host:
+        if retry_connect and self._has_jump_host:
             connect_deadline = min(
                 deadline,
                 start_time + _TUNNEL_CONNECT_GRACE_SECONDS,
