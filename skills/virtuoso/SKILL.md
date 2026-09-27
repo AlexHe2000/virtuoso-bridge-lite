@@ -134,6 +134,7 @@ Before instantiating a cell or setting parameters on it:
 | **Layout** | Create/edit layout, add shapes/vias/instances | `client.layout.*` | `references/layout-python-api.md`, `references/layout-skill-api.md` |
 | **Maestro** | Read/write ADE Assembler config, run simulations | `client.maestro.*` | `references/maestro-python-api.md`, `references/maestro-skill-api.md` |
 | **Library** | Read/create/rename/delete libraries, bind technology | `client.library.*` | `references/library-python-api.md` |
+| **SOS** | Status, checkout, checkin, and initial registration for one cellview | `client.sos.*` | `references/sos-python-api.md` |
 | **Netlist (si)** | Batch netlist generation without Maestro | `simInitEnvWithArgs` + `si` CLI | See "Batch Netlist (si)" section below |
 | **SKILL Finder** | Search SKILL function names and get detailed docs | `client.find_skill()`, `client.get_skill_more_info()` | `references/skill-finder-python-api.md` |
 | **General** | File transfer, screenshots, raw SKILL, .il loading | `client.*` | See below |
@@ -215,6 +216,7 @@ client.run_shell_command("ls /tmp/")             # run shell on remote
 client.list_windows()                            # list all open windows
 client.screenshot(target="ciw")                   # screenshot to the user artifact directory
 client.screenshot(output="output", target="ciw")  # explicit repo-local output
+client.sos.status_cellview("LIB", "CELL", "schematic")
 ```
 
 ### Batch attribute fetch: `fetch()` / `fetch_one()`

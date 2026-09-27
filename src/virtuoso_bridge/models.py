@@ -88,7 +88,13 @@ class VirtuosoInterface(ABC):
         """Ensure bridge is ready (remote setup, tunnel, daemon reachable)."""
 
     @abstractmethod
-    def execute_skill(self, skill_code: str, timeout: float = 30.0) -> VirtuosoResult:
+    def execute_skill(
+        self,
+        skill_code: str,
+        timeout: float = 30.0,
+        *,
+        retry_connect: bool = True,
+    ) -> VirtuosoResult:
         """Execute SKILL code in Virtuoso."""
 
     @abstractmethod
