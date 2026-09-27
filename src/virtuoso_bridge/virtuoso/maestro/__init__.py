@@ -14,6 +14,10 @@ from virtuoso_bridge.virtuoso.maestro.reader import (
     filter_active_state_xml,
     read_results,
     export_waveform,
+    MaestroSessionState,
+    MaestroStateProbeError,
+    get_session_state,
+    list_session_states,
 )
 from virtuoso_bridge.virtuoso.maestro.writer import (
     # test
@@ -76,6 +80,10 @@ __all__ = [
     "purge_maestro_cellviews",
     # read — aggregator (pass output_root to also write disk dump)
     "snapshot",
+    "MaestroSessionState",
+    "MaestroStateProbeError",
+    "get_session_state",
+    "list_session_states",
     # read — XML filters
     "filter_sdb_xml",
     "filter_active_state_xml",

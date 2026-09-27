@@ -22,6 +22,8 @@ from virtuoso_bridge.virtuoso.maestro.lifecycle import (
 )
 from virtuoso_bridge.virtuoso.maestro.reader import (
     export_waveform,
+    get_session_state,
+    list_session_states,
     read_results,
     snapshot,
 )
@@ -98,6 +100,8 @@ class MaestroOps:
 
     # Read results and waveforms
     snapshot = _client_method(snapshot)
+    get_session_state = _client_method(get_session_state)
+    list_session_states = _client_method(list_session_states)
     read_results = _client_method(read_results)
     export_waveform = _client_method(export_waveform)
     open_waveform_viewer = _client_method(open_waveform_viewer)
