@@ -15,6 +15,8 @@ def test_maestro_ops_exposes_every_public_client_bound_operation() -> None:
     expected = {
         "open_session", "close_session", "find_open_session",
         "open_gui_session", "close_gui_session", "purge_maestro_cellviews",
+        "list_histories", "get_history", "set_history_lock",
+        "lock_history", "unlock_history",
         "snapshot", "read_results", "export_waveform",
         "open_waveform_viewer", "close_waveform_viewer",
         "create_test", "set_design", "set_analysis", "add_output", "set_spec",

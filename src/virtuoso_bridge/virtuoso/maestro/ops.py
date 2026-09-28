@@ -20,6 +20,13 @@ from virtuoso_bridge.virtuoso.maestro.lifecycle import (
     open_gui_session,
     open_session,
 )
+from virtuoso_bridge.virtuoso.maestro.history import (
+    get_history,
+    list_histories,
+    lock_history,
+    set_history_lock,
+    unlock_history,
+)
 from virtuoso_bridge.virtuoso.maestro.reader import (
     export_waveform,
     read_results,
@@ -95,6 +102,13 @@ class MaestroOps:
     open_gui_session = _client_method(open_gui_session)
     close_gui_session = _client_method(close_gui_session)
     purge_maestro_cellviews = _client_method(_purge_maestro_cellviews)
+
+    # Simulation history retention
+    list_histories = _client_method(list_histories)
+    get_history = _client_method(get_history)
+    set_history_lock = _client_method(set_history_lock)
+    lock_history = _client_method(lock_history)
+    unlock_history = _client_method(unlock_history)
 
     # Read results and waveforms
     snapshot = _client_method(snapshot)
