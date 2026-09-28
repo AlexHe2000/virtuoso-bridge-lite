@@ -8,6 +8,17 @@ from virtuoso_bridge.virtuoso.maestro.lifecycle import (
     close_gui_session,
     _purge_maestro_cellviews as purge_maestro_cellviews,
 )
+from virtuoso_bridge.virtuoso.maestro.history import (
+    MaestroHistory,
+    MaestroHistoryError,
+    MaestroHistoryLockResult,
+    MaestroHistoryOutcomeUnknown,
+    get_history,
+    list_histories,
+    lock_history,
+    set_history_lock,
+    unlock_history,
+)
 from virtuoso_bridge.virtuoso.maestro.reader import (
     snapshot,
     filter_sdb_xml,
@@ -78,6 +89,16 @@ __all__ = [
     "open_gui_session",
     "close_gui_session",
     "purge_maestro_cellviews",
+    # result history retention
+    "MaestroHistory",
+    "MaestroHistoryError",
+    "MaestroHistoryLockResult",
+    "MaestroHistoryOutcomeUnknown",
+    "list_histories",
+    "get_history",
+    "set_history_lock",
+    "lock_history",
+    "unlock_history",
     # read — aggregator (pass output_root to also write disk dump)
     "snapshot",
     "MaestroSessionState",

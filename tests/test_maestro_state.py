@@ -380,3 +380,24 @@ def test_close_gui_session_purges_only_confirmed_closed_target(monkeypatch) -> N
     lifecycle.close_gui_session(client, "fnxSession4")
 
     assert purged == [("LIB", "CELL", "maestro")]
+
+
+def test_close_gui_window_uses_gui_runner_for_save_dialog(monkeypatch) -> None:
+    client = _Client("t")
+    daemon_runner = object()
+    gui_runner = object()
+    client.ssh_runner = daemon_runner
+    client.gui_runner = gui_runner
+    sent: list[object] = []
+    monkeypatch.setattr(lifecycle, "_send_x11_alt_n", sent.append)
+    monkeypatch.setattr(
+        lifecycle,
+        "get_session_state",
+        lambda *args: MaestroSessionState(
+            context="not_found", session="fnxSession4", source="session_inventory",
+        ),
+    )
+
+    lifecycle._close_gui_window(client, _window(modified=True), timeout=1)
+
+    assert sent == [gui_runner]

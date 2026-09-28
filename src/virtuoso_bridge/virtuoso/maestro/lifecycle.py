@@ -473,9 +473,11 @@ def _close_gui_window(client: VirtuosoClient, window_info: dict,
 
     dismiss_thread = None
     if will_pop_dialog:
-        # runner is None in local mode; _send_x11_alt_n handles both
-        # SSH and local subprocess paths internally.
-        runner = client.ssh_runner
+        # X11 belongs to the GUI host.  Fall back to the legacy runner for
+        # lightweight clients that predate the split GUI/daemon roles.
+        runner = getattr(client, "gui_runner", None)
+        if runner is None:
+            runner = client.ssh_runner
 
         def _dismiss_save_dialog():
             """Send Alt+N after a short delay to dismiss save dialog."""
