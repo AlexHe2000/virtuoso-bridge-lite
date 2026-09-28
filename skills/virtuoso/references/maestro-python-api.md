@@ -42,9 +42,16 @@ optimization loop patterns.
 | `client.maestro.open_session(lib, cell) -> str` | `maeOpenSetup` | Background open, returns session string |
 | `client.maestro.close_session(session)` | `maeCloseSession` | Background close |
 | `client.maestro.find_open_session() -> str \| None` | `maeGetSessions` + `maeGetSetup` | Find first active session with valid test |
-| `client.maestro.open_gui_session(lib, cell, *, timeout=60) -> str` | `deOpenCellView` + `maeMakeEditable` | GUI open (required for simulation) |
-| `client.maestro.close_gui_session(session, save=True, *, timeout=60)` | `hiCloseWindow` (+ `maeMakeEditable`/`dbPurge` as needed) | GUI close |
+| `client.maestro.open_gui_session(lib, cell, *, timeout=60) -> str` | `deOpenCellView(..., "a")` | GUI open directly in editable mode (required for simulation) |
+| `client.maestro.close_gui_session(session, save=True, *, timeout=60)` | `maeSaveSetup` + `hiCloseWindow` + `dbPurge` as needed | Fail-closed GUI close |
 | `client.maestro.purge_maestro_cellviews(*, timeout=60)` | `dbPurgeCellView` | Clean stale internal locks before opening |
+| `client.maestro.get_session_state(session=None, *, timeout=30)` | Atomic window/session inventory | Exact session state, or current-window context |
+| `client.maestro.list_session_states(*, timeout=30)` | Atomic window/session inventory | All observed GUI and headless sessions |
+| `client.maestro.list_histories(session)` | `axlGetHistory` | List exact names and lock/current state |
+| `client.maestro.get_history(history, session=session)` | `axlGetHistoryEntry` | Read one exact history |
+| `client.maestro.set_history_lock(history, locked, session=session)` | `maeSetHistoryLock` | Set and verify an explicit lock state |
+| `client.maestro.lock_history(history, session=session)` | `maeSetHistoryLock` | Idempotently lock one history |
+| `client.maestro.unlock_history(history, session=session)` | `maeSetHistoryLock` | Idempotently unlock one history |
 
 ```python
 session = client.maestro.open_session("PLAYGROUND_AMP", "TB_AMP_5T_D2S_DC_AC")
@@ -52,19 +59,37 @@ session = client.maestro.open_session("PLAYGROUND_AMP", "TB_AMP_5T_D2S_DC_AC")
 client.maestro.close_session(session)
 ```
 
+### Structured session state
+
+Use the state API before any workflow that may save, discard, close, or make a
+Maestro window editable:
+
+```python
+state = client.maestro.get_session_state(session)
+print(state.context, state.access, state.unsaved)
+
+for state in client.maestro.list_session_states():
+    print(state.session, state.lib, state.cell, state.access)
+```
+
+`context` is one of `gui`, `headless`, `no_window`,
+`non_maestro_window`, `not_found`, or `unknown`. `access` is `editing`,
+`reading`, or `unknown`. An `unsaved` value of `None` means the condition is
+not observable; it must not be treated as clean. The returned object also
+contains the exact window/session identity, parsed library/cell/view, raw
+title, evidence source, and diagnostics.
+
+The inventory binds windows through `axlGetWindowSession` and `davSession`,
+then parses known ADE title shapes. A session without an observed window is
+reported as `headless`; the probe does not claim whether it is a deliberate
+background session or a stale GUI session. Malformed/failed probes raise
+`MaestroStateProbeError` instead of being reported as an empty inventory.
+
 ### Preserve simulation histories
 
 Maestro normally retains only a bounded number of recent histories. Lock an
 important history to prevent its setup details and simulation results from
 being automatically deleted:
-
-| Python | SKILL | Description |
-|--------|-------|-------------|
-| `client.maestro.list_histories(session)` | `axlGetHistory` | List exact names and the lock/current state |
-| `client.maestro.get_history(history, session=session)` | `axlGetHistoryEntry` | Read one exact history |
-| `client.maestro.set_history_lock(history, locked, session=session)` | `maeSetHistoryLock` | Set and verify an explicit lock state |
-| `client.maestro.lock_history(history, session=session)` | `maeSetHistoryLock` | Idempotently lock one history |
-| `client.maestro.unlock_history(history, session=session)` | `maeSetHistoryLock` | Idempotently unlock one history |
 
 ```python
 histories = client.maestro.list_histories(session)
