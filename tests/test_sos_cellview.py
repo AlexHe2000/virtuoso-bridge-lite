@@ -330,6 +330,29 @@ def test_status_uses_server_queried_nobjstatus_fallback():
     assert len(fallback) == 1 and " -ucl " not in fallback[0]
 
 
+def test_nobjstatus_allows_unavailable_cimodified_attribute():
+    client = _Client(
+        before=CommandResult(1, "", "status denied"),
+        nobj=[_nobj(status=3, revision="7", attributes={
+            "CurrentVer": "7", "Revision": "7", "Modified": "1",
+            "OutOfDate": "0", "Reference": "",
+        })],
+    )
+    result = client.sos.status_cellview("lib", "cell", "schematic_Vt")
+    assert result.outcome == "success"
+    assert result.before.state == "O" and result.before.change == "M"
+
+
+def test_nobjstatus_rejects_invalid_cimodified_when_returned():
+    client = _Client(
+        before=CommandResult(1, "", "status denied"),
+        nobj=[_nobj(status=3, revision="7", ci_modified="invalid")],
+    )
+    result = client.sos.status_cellview("lib", "cell", "schematic_Vt")
+    assert result.outcome == "failed"
+    assert "invalid CiModified" in result.diagnostics[0]
+
+
 def test_cancel_checkout_can_verify_through_nobjstatus_fallback():
     denied = CommandResult(1, "", "status denied")
     client = _Client(nobj=[

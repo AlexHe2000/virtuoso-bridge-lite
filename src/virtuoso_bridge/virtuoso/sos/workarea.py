@@ -113,6 +113,38 @@ class SOSOps:
 
         return diagnose_cellview(self._owner, lib, cell, view, timeout=timeout, soscmd=soscmd)
 
+    def diagnose_session_cellview(self, lib: str, cell: str, view: str, *,
+                                  timeout: float = 60, soscmd: str | None = None) -> dict:
+        """Inspect the existing SOS workarea session without starting a stopped one."""
+        from .session import diagnose_session_cellview
+
+        return diagnose_session_cellview(
+            self._owner, lib, cell, view, timeout=timeout, soscmd=soscmd,
+        )
+
+    def restart_session_cellview(
+        self, lib: str, cell: str, view: str, *, dry_run: bool = False,
+        force_cadence_disconnect: bool = False, timeout: float = 60,
+        soscmd: str | None = None,
+    ) -> dict:
+        """Restart one unhealthy SOS workarea session with explicit force consent."""
+        from .session import restart_session_cellview
+
+        return restart_session_cellview(
+            self._owner, lib, cell, view, dry_run=dry_run,
+            force_cadence_disconnect=force_cadence_disconnect,
+            timeout=timeout, soscmd=soscmd,
+        )
+
+    def lock_info_cellview(self, lib: str, cell: str, view: str, *,
+                           timeout: float = 60, soscmd: str | None = None):
+        """Return exact server-queried checkout ownership for one cellview."""
+        from .session import lock_info_cellview
+
+        return lock_info_cellview(
+            self._owner, lib, cell, view, timeout=timeout, soscmd=soscmd,
+        )
+
     def reconcile_cellview(self, lib: str, cell: str, view: str, *, receipt: dict,
                            timeout: float = 60, soscmd: str | None = None) -> dict:
         """Compare an uncertain operation receipt with fresh state; never retry it."""
