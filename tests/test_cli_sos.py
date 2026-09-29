@@ -58,6 +58,19 @@ def test_cli_status_does_not_forward_mutation_flags(monkeypatch, capsys):
     assert calls[-1][-1] == {"timeout": 60}
 
 
+def test_cli_cancel_checkout_routes_dry_run_profile_and_executable(monkeypatch, capsys):
+    calls = _install(monkeypatch)
+    rc = cli.main([
+        "sos", "cancel-co", "lib", "cell", "schematic_Vt", "--dry-run", "--json",
+        "-p", "worker1", "--soscmd", "/site/sos wrapper",
+    ])
+    assert rc == 0 and json.loads(capsys.readouterr().out)["outcome"] == "dry_run"
+    assert calls == [("profile", "worker1"), (
+        "cancel_checkout_cellview", "lib", "cell", "schematic_Vt",
+        {"dry_run": True, "timeout": 60, "soscmd": "/site/sos wrapper"},
+    )]
+
+
 def test_cli_requires_explicit_view_and_checkin_message():
     for args in (["sos", "co", "lib", "cell"], ["sos", "ci", "lib", "cell", "schematic"],
                  ["sos", "register", "lib", "cell", "schematic"],

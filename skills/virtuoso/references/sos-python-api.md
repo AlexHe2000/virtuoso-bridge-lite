@@ -33,6 +33,9 @@ status = client.sos.status_cellview("LIB", "CELL", "schematic")
 checkout = client.sos.checkout_cellview(
     "LIB", "CELL", "schematic", dry_run=True,
 )
+cancel = client.sos.cancel_checkout_cellview(
+    "LIB", "CELL", "schematic", dry_run=True,
+)
 checkin = client.sos.checkin_cellview(
     "LIB", "CELL", "schematic", message="Fix gain", dry_run=True,
 )
@@ -55,6 +58,13 @@ while a Maestro session is open, the operation is blocked instead of falling
 back to `ddCheckin`, because direct GDM callbacks can change an unrelated ADE
 session mode on some IC/SOS releases.
 
+Cancel checkout is deliberately narrower than the SOS GUI's force-discard
+option. It accepts only a saved, clean checkout in the current workarea and
+invokes `soscmd discardco` without `-F`; modified content is never discarded.
+Bridge re-resolves the CIW target and refreshes SOS state immediately before
+the one-shot command. Success additionally requires the same revision to be
+checked in and clean afterward.
+
 Results contain `target`, `before`, `after`, `outcome`, and `diagnostics`.
 `success`, `noop`, and `dry_run` set `ok=True`. A timeout or lost response after
 dispatch is `unknown`: Bridge queries fresh SOS state but never resends the
@@ -66,6 +76,7 @@ Use `reconcile_cellview(..., receipt=previous_result)` for a read-only follow-up
 ```bash
 virtuoso-bridge sos status LIB CELL schematic -p lab --json
 virtuoso-bridge sos co LIB CELL schematic --dry-run -p lab --json
+virtuoso-bridge sos cancel-co LIB CELL schematic --dry-run -p lab --json
 virtuoso-bridge sos ci LIB CELL schematic -m "Fix gain" --dry-run -p lab --json
 virtuoso-bridge sos register LIB NEW_CELL schematic -m "Initial version" --dry-run -p lab --json
 virtuoso-bridge sos doctor LIB CELL schematic -p lab --json

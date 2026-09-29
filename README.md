@@ -30,7 +30,7 @@ A new infrastructure for **Agentic Analog and Mixed-Signal Design**. LLM Agents 
 - **Four design domains**: schematic editing, layout generation, simulation setup (Maestro), and standalone Spectre with PSF parsing
 - **Deterministic schematic planning**: explicit connectivity plus hard/soft grid, polarity-row, differential-pair, pin-column, and output-stage constraints
 - **Exact schematic recreation**: import routed source geometry through explicit PDK maps, live symbol-pin audits, readback verification, and batch GUI screenshots
-- **Optional SOS cellview control**: explicit status/checkout/checkin/initial registration with dry-run, post-state verification, and unknown-result safety
+- **Optional SOS cellview control**: explicit status/checkout/cancel-checkout/checkin/initial registration with dry-run, post-state verification, and unknown-result safety
 
 **2. Scalable Architecture** — Multi-server, multi-session, built for distributed design clusters.
 - Multi-profile SSH: connect to N design servers, each with independent tunnel

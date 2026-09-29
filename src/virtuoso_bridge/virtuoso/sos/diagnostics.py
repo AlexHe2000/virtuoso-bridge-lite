@@ -56,12 +56,12 @@ def diagnose_cellview(owner, lib, cell, view, *, timeout=60, soscmd=None) -> dic
                        "detail": "; ".join(result.diagnostics) or "One target state obtained."})
     eligibility = {}
     if result and result.before:
-        for action in ("co", "ci", "register"):
+        for action in ("co", "cancel_co", "ci", "register"):
             decision = _target_precondition(target) or _precondition(action, result.before)
-            if action in {"ci", "register"} and _is_calibre_target(
+            if action in {"cancel_co", "ci", "register"} and _is_calibre_target(
                 target.lib, target.cell, target.view, target.directory, target.master,
             ):
-                decision = ("blocked", "Calibre-related targets cannot be checked in.")
+                decision = ("blocked", "Calibre-related targets cannot be mutated.")
             eligibility[action] = {"outcome": decision[0] if decision else "dry_run",
                                    "detail": decision[1] if decision else "Preconditions currently satisfied."}
     ok = result is not None and result.ok and all(check["ok"] for check in checks)
@@ -79,8 +79,8 @@ def validate_receipt(lib, cell, view, receipt: dict, timeout=60):
     if isinstance(receipt.get("sos"), dict):
         receipt = receipt["sos"]
     action = receipt.get("action")
-    if action not in {"co", "ci", "register"} or receipt.get("outcome") != "unknown":
-        raise ValueError("Only an unknown co/ci/register receipt can be reconciled.")
+    if action not in {"co", "cancel_co", "ci", "register"} or receipt.get("outcome") != "unknown":
+        raise ValueError("Only an unknown co/cancel_co/ci/register receipt can be reconciled.")
     previous = receipt.get("target")
     if not isinstance(previous, dict) or any(previous.get(key) != getattr(target, key)
                                             for key in ("lib", "cell", "view")):

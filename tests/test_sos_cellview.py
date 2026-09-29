@@ -30,7 +30,7 @@ class _Client:
 
     def __init__(self, *, before=None, after=None, dirty=False, view_type="schematic",
                  mutation=None, native=False, native_dispatch=None, native_result=None,
-                 maestro=False):
+                 maestro=False, discard=None):
         self.sos_runner = self
         self.commands = []
         self.skill_calls = []
@@ -49,6 +49,7 @@ class _Client:
         self.native_result = (native_result if native_result is not None
                               else _skill_ok('("ok" t t t nil)'))
         self.maestro = maestro
+        self.discard = discard if discard is not None else CommandResult(0, "", "")
         self.root = CommandResult(0, ROOT + "\n", "")
         self.sos = SOSOps(self)
 
@@ -60,6 +61,11 @@ class _Client:
         assert parts[:2] == ["cd", DIRECTORY if "findwaroot" in parts else ROOT]
         if parts[-1] == "findwaroot":
             return self.root
+        if parts[3:5] == ["/opt/sos/bin/soscmd", "discardco"]:
+            assert parts[5:] == ["./" + PATH]
+            if isinstance(self.discard, Exception):
+                raise self.discard
+            return self.discard
         assert parts[3:6] == ["/opt/sos/bin/soscmd", "status", "-Nhdr"]
         assert parts[-1] == "./" + PATH
         state = next(self.states)
@@ -98,11 +104,16 @@ class _Client:
     def writes(self):
         return [code for code, _ in self.skill_calls
                 if "ddCheckin(" in code or "ddCheckout(" in code
-                or "VB_SOS_NATIVE_DISPATCH" in code]
+                or "VB_SOS_NATIVE_DISPATCH" in code] + [
+                    command for command in self.commands if " discardco " in command]
 
 
 def _ci(client, **kwargs):
     return client.sos.checkin_cellview("lib", "cell", "schematic_Vt", message="Saved changes", **kwargs)
+
+
+def _cancel(client, **kwargs):
+    return client.sos.cancel_checkout_cellview("lib", "cell", "schematic_Vt", **kwargs)
 
 
 def _unmanaged(kind="d", path=PATH):
@@ -400,6 +411,88 @@ def test_checkout_verified():
     result = client.sos.checkout_cellview("lib", "cell", "schematic_Vt")
     assert result.ok and result.after.state == "O"
     assert len(client.writes) == 1
+
+
+def test_cancel_checkout_releases_only_clean_package_without_force():
+    client = _Client()
+    client.states = iter([
+        _state("O", "-", "3"), _state("O", "-", "3"), _state("-", "-", "3"),
+    ])
+    result = _cancel(client)
+    assert result.outcome == "success" and result.after.revision == "3"
+    assert len(client.writes) == 1
+    command = shlex.split(client.writes[0])
+    assert command[3:] == ["/opt/sos/bin/soscmd", "discardco", "./" + PATH]
+    assert "-F" not in command
+
+
+@pytest.mark.parametrize("state,expected", [
+    (_state("O", "M"), "blocked"),
+    (_state("-", "-"), "noop"),
+    (_state("O", "-", lock="L"), "blocked"),
+])
+def test_cancel_checkout_preconditions_never_discard(state, expected):
+    client = _Client(before=state)
+    result = _cancel(client)
+    assert result.outcome == expected
+    assert not client.writes
+
+
+def test_cancel_checkout_rechecks_sos_state_before_discard():
+    client = _Client()
+    client.states = iter([_state("O", "-"), _state("O", "M")])
+    result = _cancel(client)
+    assert result.outcome == "blocked"
+    assert not client.writes
+
+
+def test_cancel_checkout_lost_reply_is_unknown_and_never_retried():
+    client = _Client(discard=TimeoutError("response lost"))
+    client.states = iter([
+        _state("O", "-", "3"), _state("O", "-", "3"), _state("-", "-", "3"),
+    ])
+    result = _cancel(client)
+    assert result.outcome == "unknown" and result.after.state == "-"
+    assert len(client.writes) == 1
+
+
+def test_cancel_checkout_nonzero_reply_with_matching_state_is_unknown():
+    client = _Client(discard=CommandResult(1, "", "server error"))
+    client.states = iter([
+        _state("O", "-", "3"), _state("O", "-", "3"), _state("-", "-", "3"),
+    ])
+    result = _cancel(client)
+    assert result.outcome == "unknown" and "server error" in result.diagnostics[0]
+    assert len(client.writes) == 1
+
+
+def test_cancel_checkout_requires_same_revision_after_discard():
+    client = _Client()
+    client.states = iter([
+        _state("O", "-", "3"), _state("O", "-", "3"), _state("-", "-", "4"),
+    ])
+    result = _cancel(client)
+    assert result.outcome == "failed"
+    assert len(client.writes) == 1
+
+
+def test_cancel_checkout_dry_run_does_not_discard():
+    client = _Client(before=_state("O", "-"))
+    assert _cancel(client, dry_run=True).outcome == "dry_run"
+    assert not client.writes
+
+
+def test_cancel_checkout_blocks_unsaved_connected_buffer():
+    client = _Client(dirty=True, before=_state("O", "-"))
+    result = _cancel(client)
+    assert result.outcome == "blocked" and not client.writes
+
+
+def test_cancel_checkout_blocks_calibre_before_remote_access():
+    client = _Client()
+    result = client.sos.cancel_checkout_cellview("lib", "cell", "Calibre_PEX")
+    assert result.outcome == "blocked"
+    assert not client.skill_calls and not client.commands
 
 
 @pytest.mark.parametrize("view_type", ["schematic", "schematicSymbol", "maskLayout"])

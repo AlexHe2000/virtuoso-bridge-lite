@@ -134,7 +134,7 @@ Before instantiating a cell or setting parameters on it:
 | **Layout** | Create/edit layout, add shapes/vias/instances | `client.layout.*` | `references/layout-python-api.md`, `references/layout-skill-api.md` |
 | **Maestro** | Read/write ADE Assembler config, run simulations | `client.maestro.*` | `references/maestro-python-api.md`, `references/maestro-skill-api.md` |
 | **Library** | Read/create/rename/delete libraries, bind technology | `client.library.*` | `references/library-python-api.md` |
-| **SOS** | Status, checkout, checkin, and initial registration for one cellview | `client.sos.*` | `references/sos-python-api.md` |
+| **SOS** | Status, checkout, safe cancel-checkout, checkin, and initial registration for one cellview | `client.sos.*` | `references/sos-python-api.md` |
 | **Netlist (si)** | Batch netlist generation without Maestro | `simInitEnvWithArgs` + `si` CLI | See "Batch Netlist (si)" section below |
 | **SKILL Finder** | Search SKILL function names and get detailed docs | `client.find_skill()`, `client.get_skill_more_info()` | `references/skill-finder-python-api.md` |
 | **General** | File transfer, screenshots, raw SKILL, .il loading | `client.*` | See below |

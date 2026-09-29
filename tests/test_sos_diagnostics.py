@@ -21,6 +21,8 @@ def receipt(action="ci"):
     before = SOSCellViewState("p", "O", "M", "-", "-", "-", "3")
     if action == "co":
         before = SOSCellViewState("p", "-", "-", "-", "-", "-", "3")
+    elif action == "cancel_co":
+        before = SOSCellViewState("p", "O", "-", "-", "-", "-", "3")
     elif action == "register":
         before = SOSCellViewState("d", "?", "?", "?", "?", "?", "?")
     target = SOSCellViewTarget("lib", "cell", "schematic_Vt", directory=DIRECTORY,
@@ -34,6 +36,7 @@ def test_doctor_queries_capabilities_version_and_target_without_mutation(unmanag
     result = client.sos.diagnose_cellview("lib", "cell", "schematic_Vt")
     assert result["ok"] and all(check["ok"] for check in result["checks"])
     assert result["eligibility"]["register"]["outcome"] == ("dry_run" if unmanaged else "blocked")
+    assert "cancel_co" in result["eligibility"]
     assert not client.writes
     assert not any("history" in cmd or "diff" in cmd for cmd in client.commands)
 
@@ -69,6 +72,7 @@ def test_doctor_reports_dirty_target_without_saving_it():
 
 @pytest.mark.parametrize("action,after", [
     ("ci", _state("-", "-", "4")), ("co", _state("O", "-", "3")),
+    ("cancel_co", _state("-", "-", "3")),
     ("register", _state("-", "-", "1")),
 ])
 def test_reconciliation_observes_expected_state_but_never_confirms_or_retries(action, after):
