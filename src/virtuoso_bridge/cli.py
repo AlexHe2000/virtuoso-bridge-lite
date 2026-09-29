@@ -1796,6 +1796,10 @@ def cli_sos(*, action: str, lib: str, cell: str, view: str,
                 payload = client.sos.checkout_cellview(
                     lib, cell, view, dry_run=dry_run, **options,
                 ).to_dict()
+            elif action == "cancel-co":
+                payload = client.sos.cancel_checkout_cellview(
+                    lib, cell, view, dry_run=dry_run, **options,
+                ).to_dict()
             elif action in {"ci", "register"}:
                 operation = (
                     client.sos.register_cellview if action == "register"
@@ -1850,7 +1854,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     sp_sos = subparsers.add_parser("sos", help="Operate on one SOS-managed cellview")
     sos_actions = sp_sos.add_subparsers(dest="sos_action", required=True)
-    for action in ("status", "co", "ci", "register", "doctor", "reconcile"):
+    for action in ("status", "co", "cancel-co", "ci", "register", "doctor", "reconcile"):
         sub = sos_actions.add_parser(action)
         sub.add_argument("lib")
         sub.add_argument("cell")
@@ -1861,7 +1865,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--timeout", type=float, default=60)
         sub.add_argument("--soscmd", default=None,
                          help="SOS executable or site wrapper on the GUI host")
-        if action in {"co", "ci", "register"}:
+        if action in {"co", "cancel-co", "ci", "register"}:
             sub.add_argument("--dry-run", action="store_true")
         if action in {"ci", "register"}:
             sub.add_argument("-m", "--message", required=True)

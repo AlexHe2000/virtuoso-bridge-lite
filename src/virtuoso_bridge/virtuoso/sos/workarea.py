@@ -69,6 +69,18 @@ class SOSOps:
             self._owner, "co", lib, cell, view, dry_run=dry_run, timeout=timeout, soscmd=soscmd,
         )
 
+    def cancel_checkout_cellview(
+        self, lib: str, cell: str, view: str, *, dry_run: bool = False, timeout: float = 60,
+        soscmd: str | None = None,
+    ) -> SOSCellViewResult:
+        """Release one clean checkout with SOS ``discardco``; never discard modifications."""
+        from .cellview import operate_cellview
+
+        return operate_cellview(
+            self._owner, "cancel_co", lib, cell, view,
+            dry_run=dry_run, timeout=timeout, soscmd=soscmd,
+        )
+
     def checkin_cellview(
         self, lib: str, cell: str, view: str, *, message: str,
         dry_run: bool = False, timeout: float = 60,

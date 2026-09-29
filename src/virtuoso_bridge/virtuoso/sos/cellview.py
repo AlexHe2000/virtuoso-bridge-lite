@@ -381,6 +381,16 @@ def _precondition(action: str, state: SOSCellViewState):
                 "cannot be registered; use the normal checkout/checkin workflow for managed views."
             )
         return None
+    if action == "cancel_co":
+        if state.object_type != "p" or state.revision == "?":
+            return "blocked", "Target must be an existing managed SOS package."
+        if state.lock != "-":
+            return "blocked", "Target is locked in another workarea, or lock status is unavailable."
+        if state.state == "-" and state.change == "-":
+            return "noop", "Target is already checked in; no checkout was released."
+        if state.state != "O" or state.change != "-":
+            return "blocked", "Cancel checkout requires this workarea's checkout to be saved and unmodified."
+        return None
     if state.object_type != "p" or state.revision == "?":
         return "blocked", "Target must be an existing managed SOS package, not a reference or unmanaged object."
     if state.lock != "-":
@@ -405,6 +415,9 @@ def _verified(action: str, before: SOSCellViewState, after: SOSCellViewState) ->
         return False
     if action == "co":
         return after.state == "O" and after.change in {"-", "M"}
+    if action == "cancel_co":
+        return (after.state == "-" and after.change == "-"
+                and after.revision == before.revision)
     if action == "register":
         return (after.state == "-" and after.change == "-"
                 and after.newer == "-" and after.rso == "-"
@@ -454,7 +467,7 @@ def operate_cellview(
 ) -> SOSCellViewResult:
     """Perform one GDM action at most once; report uncertain outcomes explicitly."""
     target = SOSCellViewTarget(*(_text(v, name) for v, name in ((lib, "lib"), (cell, "cell"), (view, "view"))))
-    if action not in {"status", "co", "ci", "register"}:
+    if action not in {"status", "co", "cancel_co", "ci", "register"}:
         raise ValueError(f"Unsupported SOS cellview action: {action}")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout must be finite and positive.")
@@ -467,8 +480,8 @@ def operate_cellview(
     def report(outcome: Outcome, *diagnostics: str) -> SOSCellViewResult:
         return SOSCellViewResult(action, outcome, target, before, after, tuple(diagnostics))
 
-    if action in {"ci", "register"} and _is_calibre_target(lib, cell, view):
-        return report("blocked", "Calibre-related targets cannot be checked in through this API.")
+    if action in {"cancel_co", "ci", "register"} and _is_calibre_target(lib, cell, view):
+        return report("blocked", "Calibre-related targets cannot be mutated through this API.")
 
     try:
         if sos_runner(owner) is None:
@@ -488,8 +501,8 @@ def operate_cellview(
         target = replace(target, directory=directory, master=master,
                          view_type=resolved[3] or "",
                          unsaved=(resolved[4] is True) if resolved[3] in _OA_TYPES else None)
-        if action in {"ci", "register"} and _is_calibre_target(directory, master):
-            return report("blocked", "Resolved path belongs to a Calibre-related target; checkin is prohibited.")
+        if action in {"cancel_co", "ci", "register"} and _is_calibre_target(directory, master):
+            return report("blocked", "Resolved path belongs to a Calibre-related target; mutation is prohibited.")
         if action == "register":
             decision = _target_precondition(target)
             if decision:
@@ -504,7 +517,7 @@ def operate_cellview(
             raise RuntimeError("Resolved cellview is outside the returned SOS workarea.")
         target = replace(target, workarea=workarea, path=posixpath.relpath(directory, workarea))
         area = SOSWorkarea(owner, workarea, soscmd=executable)
-        if action in {"co", "ci"}:
+        if action in {"co", "cancel_co", "ci"}:
             decision = _target_precondition(target)
             if decision:
                 return report(*decision)
@@ -516,7 +529,24 @@ def operate_cellview(
         if decision:
             return report(*decision)
         if dry_run:
-            return report("dry_run", "Preconditions passed; no checkout/checkin was executed.")
+            return report("dry_run", "Preconditions passed; no SOS mutation was executed.")
+        if action == "cancel_co":
+            # Re-resolve the cellview and refresh SOS immediately before the one-shot discard.
+            refreshed_target = _decode(owner.execute_skill(
+                _skill(target, required_action="cancel_co"), timeout=timeout,
+            ))
+            if refreshed_target != [
+                "ok", target.directory, target.master, target.view_type, None,
+            ]:
+                return report(
+                    "blocked",
+                    "Target identity or connected-CIW save state changed before cancel checkout.",
+                )
+            refreshed_state = _read_state(area, target, timeout)
+            if refreshed_state != before:
+                return report(
+                    "blocked", "SOS state changed before cancel checkout; inspect status first.",
+                )
         if action == "register":
             # A previous dry-run is not authorization to treat a now-managed object
             # as new. Refresh once immediately before sending the one-shot GDM call.
@@ -535,6 +565,38 @@ def operate_cellview(
         return report("blocked", str(exc))
     except Exception as exc:
         return report("failed", str(exc))
+
+    if action == "cancel_co":
+        diagnostics = []
+        discard_reply = None
+        try:
+            discard_reply = area._run("discardco", "./" + target.path, timeout=timeout)
+        except Exception as exc:
+            diagnostics.append(f"SOS discardco result unavailable: {exc}")
+        try:
+            after = _read_state(area, target, timeout)
+        except Exception as exc:
+            diagnostics.append(f"Post-operation SOS status unavailable: {exc}")
+        if discard_reply is None:
+            if after is not None and _verified(action, before, after):
+                diagnostics.append(
+                    "SOS now shows the intended state, but the discardco result was not confirmed."
+                )
+            return report("unknown", *diagnostics,
+                          "Do not retry automatically; inspect SOS status first.")
+        detail = discard_reply.stderr.strip() or discard_reply.stdout.strip()
+        if discard_reply.returncode:
+            if after is not None and _verified(action, before, after):
+                diagnostics.insert(0, detail or "SOS discardco returned a nonzero status.")
+                return report("unknown", *diagnostics,
+                              "Do not retry automatically; inspect SOS status first.")
+            return report("failed", detail or "SOS discardco failed.", *diagnostics)
+        if after is None:
+            return report("unknown", *diagnostics,
+                          "SOS discardco succeeded but post-operation status is unavailable.")
+        if not _verified(action, before, after):
+            return report("failed", "SOS discardco succeeded but its postcondition did not match.")
+        return report("success")
 
     # From here, an incomplete response may mean a completed server-side write.
     # Only SSH status reads are allowed after ambiguity; never resend GDM.
