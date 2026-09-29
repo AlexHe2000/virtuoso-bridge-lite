@@ -21,8 +21,29 @@ def _skill_ok(output):
     return VirtuosoResult(status=ExecutionStatus.SUCCESS, output=output)
 
 
-def _state(state="O", change="M", revision="3", *, lock="-", path=PATH, kind="p"):
-    return CommandResult(0, f"{kind}\t{state}\t{change}\t{lock}\t-\t-\t{revision}\t./{path}\n", "")
+def _state(state="O", change="M", revision="3", *, lock="-", newer="-", rso="-",
+           path=PATH, kind="p"):
+    return CommandResult(
+        0, f"{kind}\t{state}\t{change}\t{lock}\t{newer}\t{rso}\t{revision}\t./{path}\n", "",
+    )
+
+
+def _nobj(status=5, kind=3, revision="3", *, modified="0", ci_modified="0",
+          out_of_date="0", reference="", path=PATH, attributes=None):
+    values = attributes if attributes is not None else {
+        "CurrentVer": revision,
+        "Modified": modified,
+        "CiModified": ci_modified,
+        "OutOfDate": out_of_date,
+        "Reference": reference,
+        "Revision": revision,
+    }
+    rows = ["!nObjStatus! 1", "!Record!", "./" + path, str(status), str(kind)]
+    for key, value in values.items():
+        rows.extend([key, str(len(value.encode("utf-8")))])
+        if value:
+            rows.append(value)
+    return CommandResult(0, "\n".join(rows) + "\n", "")
 
 
 class _Client:
@@ -30,7 +51,7 @@ class _Client:
 
     def __init__(self, *, before=None, after=None, dirty=False, view_type="schematic",
                  mutation=None, native=False, native_dispatch=None, native_result=None,
-                 maestro=False, discard=None):
+                 maestro=False, discard=None, nobj=None):
         self.sos_runner = self
         self.commands = []
         self.skill_calls = []
@@ -38,6 +59,7 @@ class _Client:
             before if before is not None else _state(),
             after if after is not None else _state("-", "-", "4"),
         ])
+        self.nobj = iter(nobj if nobj is not None else [])
         self.resolution = _skill_ok(
             f'("ok" {json.dumps(DIRECTORY)} {json.dumps(MASTER)} '
             f'{json.dumps(view_type)} {"t" if dirty else "nil"})'
@@ -66,6 +88,16 @@ class _Client:
             if isinstance(self.discard, Exception):
                 raise self.discard
             return self.discard
+        if parts[3:5] == ["/opt/sos/bin/soscmd", "nobjstatus"]:
+            assert parts[5:-1] == [
+                "-gaRevision", "-gaCurrentVer", "-gaModified",
+                "-gaCiModified", "-gaOutOfDate",
+                "-gaReference",
+            ]
+            state = next(self.nobj)
+            if isinstance(state, Exception):
+                raise state
+            return state
         assert parts[3:6] == ["/opt/sos/bin/soscmd", "status", "-Nhdr"]
         assert parts[-1] == "./" + PATH
         state = next(self.states)
@@ -278,6 +310,91 @@ def test_register_repeat_is_blocked_without_another_revision():
 def test_normal_checkin_still_rejects_unmanaged_view():
     client = _Client(before=_unmanaged())
     assert _ci(client).outcome == "blocked"
+    assert not client.writes
+
+
+def test_status_uses_server_queried_nobjstatus_fallback():
+    client = _Client(
+        before=CommandResult(1, "", "status denied"),
+        nobj=[_nobj(status=3, revision="7", modified="1", out_of_date="1")],
+    )
+    result = client.sos.status_cellview("lib", "cell", "schematic_Vt")
+    assert result.outcome == "success"
+    assert result.after is None
+    assert (result.before.object_type, result.before.state, result.before.change,
+            result.before.lock, result.before.newer, result.before.rso,
+            result.before.revision) == (
+                "p", "O", "M", "-", "N", "-", "7",
+            )
+    fallback = [command for command in client.commands if " nobjstatus " in command]
+    assert len(fallback) == 1 and " -ucl " not in fallback[0]
+
+
+def test_cancel_checkout_can_verify_through_nobjstatus_fallback():
+    denied = CommandResult(1, "", "status denied")
+    client = _Client(nobj=[
+        _nobj(status=3, revision="5"),
+        _nobj(status=3, revision="5"),
+        _nobj(status=5, revision="5"),
+    ])
+    client.states = iter([denied, denied, denied])
+    result = _cancel(client)
+    assert result.outcome == "success"
+    assert result.before.revision == result.after.revision == "5"
+    assert len(client.writes) == 1
+
+
+def test_register_can_verify_through_nobjstatus_fallback():
+    denied = CommandResult(1, "", "status denied")
+    client = _registration_client()
+    client.states = iter([denied, denied, denied])
+    client.nobj = iter([
+        _nobj(status=2), _nobj(status=2), _nobj(status=5, revision="1"),
+    ])
+    result = _register(client)
+    assert result.outcome == "success"
+    assert result.after.revision == "1" and result.after.rso == "-"
+    assert len(client.writes) == 1
+
+
+@pytest.mark.parametrize("action", ["co", "cancel_co", "ci"])
+def test_nobjstatus_reference_objects_never_trigger_writes(action):
+    client = _Client(
+        before=CommandResult(1, "", "status denied"),
+        nobj=[_nobj(status=5 if action == "co" else 3, reference="linked")],
+    )
+    if action == "co":
+        result = client.sos.checkout_cellview("lib", "cell", "schematic_Vt")
+    elif action == "cancel_co":
+        result = _cancel(client)
+    else:
+        result = _ci(client)
+    assert result.outcome == "blocked" and result.before.rso == "R"
+    assert not client.writes
+
+
+def test_nobjstatus_unlocked_checkout_remains_blocked():
+    client = _Client(
+        before=CommandResult(1, "", "status denied"),
+        nobj=[_nobj(status=6, revision="5")],
+    )
+    result = _cancel(client)
+    assert result.outcome == "blocked"
+    assert result.before.lock == "?"
+    assert not client.writes
+
+
+def test_malformed_nobjstatus_fallback_never_triggers_write():
+    client = _Client(
+        before=CommandResult(1, "", "status denied"),
+        nobj=[_nobj(attributes={
+            "CurrentVer": "4", "Revision": "5", "Modified": "0",
+            "CiModified": "0", "OutOfDate": "0", "Reference": "",
+        })],
+    )
+    result = _cancel(client)
+    assert result.outcome == "failed"
+    assert "inconsistent revision" in result.diagnostics[0]
     assert not client.writes
 
 

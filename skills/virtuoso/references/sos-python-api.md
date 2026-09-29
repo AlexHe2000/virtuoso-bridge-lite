@@ -52,6 +52,12 @@ reject any target whose logical name or resolved path contains `calibre`.
 The API resolves the real view directory and master file in the connected CIW,
 verifies the SOS workarea and exact status row, rejects unsaved buffers, and
 rechecks target identity immediately before a write. Checkout uses `ddCheckout`.
+Some SOS sites deny the formatted `status` operation even though the client is
+connected to the project server. In that case Bridge falls back to an exact,
+server-queried `nobjstatus` request. It deliberately does not pass `-ucl`, which
+would read cached client information. The fallback requires one matching object,
+consistent revision fields, and valid modification/lock flags; malformed or
+ambiguous output blocks writes.
 Checkin and initial registration prefer the installed SOS Design Manager flow
 when its runtime capabilities are present. If that native flow is unavailable
 while a Maestro session is open, the operation is blocked instead of falling
