@@ -328,6 +328,115 @@ def _decode(result) -> list:
     return value
 
 
+_NOBJSTATUS_ATTRIBUTES = (
+    "-gaRevision", "-gaCurrentVer", "-gaModified", "-gaCiModified", "-gaOutOfDate",
+    "-gaReference",
+)
+
+
+def _parse_nobjstatus(output: str, target: SOSCellViewTarget) -> SOSCellViewState:
+    """Parse one length-prefixed, server-queried SOS nobjstatus record."""
+    payload = output.encode("utf-8")
+    offset = 0
+
+    def read_line(label: str) -> bytes:
+        nonlocal offset
+        end = payload.find(b"\n", offset)
+        if end < 0:
+            raise RuntimeError(f"Malformed SOS nobjstatus output: missing {label}.")
+        value = payload[offset:end]
+        offset = end + 1
+        return value[:-1] if value.endswith(b"\r") else value
+
+    header = read_line("header")
+    match = re.fullmatch(br"!nObjStatus! ([0-9]+)", header)
+    if match is None or int(match.group(1)) != 1:
+        raise RuntimeError("SOS nobjstatus must return exactly one record.")
+    if read_line("record marker") != b"!Record!":
+        raise RuntimeError("Malformed SOS nobjstatus record marker.")
+
+    path = read_line("object path").decode("utf-8", "strict")
+    if path not in {target.path, "./" + target.path}:
+        raise RuntimeError("SOS nobjstatus returned a different object path.")
+    status_code = read_line("status code").decode("ascii", "strict")
+    type_code = read_line("object type").decode("ascii", "strict")
+
+    attributes: dict[str, str] = {}
+    while offset < len(payload):
+        if payload[offset:].strip(b"\r\n") == b"":
+            break
+        key = read_line("attribute name").decode("utf-8", "strict")
+        length_text = read_line("attribute length")
+        if not re.fullmatch(br"[0-9]+", length_text):
+            raise RuntimeError("Malformed SOS nobjstatus attribute length.")
+        length = int(length_text)
+        end = offset + length
+        if end > len(payload):
+            raise RuntimeError("Truncated SOS nobjstatus attribute value.")
+        value = payload[offset:end].decode("utf-8", "strict")
+        offset = end
+        if length == 0:
+            pass
+        elif payload[offset:offset + 2] == b"\r\n":
+            offset += 2
+        elif payload[offset:offset + 1] == b"\n":
+            offset += 1
+        else:
+            raise RuntimeError("Malformed SOS nobjstatus attribute terminator.")
+        if not key or key in attributes:
+            raise RuntimeError("Duplicate or empty SOS nobjstatus attribute.")
+        attributes[key] = value
+
+    object_types = {"1": "f", "2": "d", "3": "p"}
+    object_type = object_types.get(type_code)
+    if object_type is None:
+        raise RuntimeError(f"Unsupported SOS nobjstatus object type: {type_code!r}.")
+    if status_code in {"0", "1"}:
+        raise _ObjectUnavailable("SOS nobjstatus reports that the target is unavailable.")
+    if status_code == "2":
+        return SOSCellViewState(object_type, "?", "?", "?", "?", "?", "?")
+    state_and_lock = {
+        "3": ("O", "-"),
+        "4": ("-", "L"),
+        "5": ("-", "-"),
+        "6": ("O", "?"),
+    }
+    if status_code not in state_and_lock:
+        raise RuntimeError(f"Unsupported SOS nobjstatus state: {status_code!r}.")
+
+    flags = {}
+    for name in ("Modified", "CiModified", "OutOfDate"):
+        value = attributes.get(name)
+        if value not in {"0", "1"}:
+            raise RuntimeError(f"SOS nobjstatus is missing a valid {name} flag.")
+        flags[name] = value
+    if "Reference" not in attributes:
+        raise RuntimeError("SOS nobjstatus is missing the Reference attribute.")
+    revision = attributes.get("Revision") or attributes.get("CurrentVer")
+    current = attributes.get("CurrentVer")
+    if (not revision or any(char in revision for char in "\x00\r\n\t")
+            or (current and current != revision)):
+        raise RuntimeError("SOS nobjstatus returned an invalid or inconsistent revision.")
+
+    state, lock = state_and_lock[status_code]
+    change = "M" if flags["Modified"] == "1" or flags["CiModified"] == "1" else "-"
+    newer = "N" if flags["OutOfDate"] == "1" else "-"
+    rso = "R" if attributes["Reference"] else "-"
+    return SOSCellViewState(object_type, state, change, lock, newer, rso, revision)
+
+
+def _read_nobj_state(
+    area: SOSWorkarea, target: SOSCellViewTarget, timeout: float,
+) -> SOSCellViewState:
+    result = area._run(
+        "nobjstatus", *_NOBJSTATUS_ATTRIBUTES, "./" + target.path, timeout=timeout,
+    )
+    if result.returncode:
+        raise RuntimeError(
+            result.stderr.strip() or result.stdout.strip() or "SOS nobjstatus failed."
+        )
+    return _parse_nobjstatus(result.stdout, target)
+
 def _read_state(area: SOSWorkarea, target: SOSCellViewTarget, timeout: float, *,
                 include_unmanaged: bool = False) -> SOSCellViewState:
     # Selection filters imply recursion in SOS unless -sNr explicitly disables it.
@@ -335,7 +444,13 @@ def _read_state(area: SOSWorkarea, target: SOSCellViewTarget, timeout: float, *,
     result = area._run("status", "-Nhdr", "-f" + _STATUS_FORMAT,
                        *selection, "./" + target.path, timeout=timeout)
     if result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "SOS status failed.")
+        detail = result.stderr.strip() or result.stdout.strip() or "SOS status failed."
+        try:
+            return _read_nobj_state(area, target, timeout)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{detail}; server-queried nobjstatus fallback failed: {exc}"
+            ) from exc
     lines = [
         line for line in result.stdout.splitlines()
         if line.strip() and line.strip() not in _STATUS_NOTICES
@@ -384,6 +499,8 @@ def _precondition(action: str, state: SOSCellViewState):
     if action == "cancel_co":
         if state.object_type != "p" or state.revision == "?":
             return "blocked", "Target must be an existing managed SOS package."
+        if state.rso != "-":
+            return "blocked", "Reference or ambiguous SOS objects cannot be mutated."
         if state.lock != "-":
             return "blocked", "Target is locked in another workarea, or lock status is unavailable."
         if state.state == "-" and state.change == "-":
@@ -391,7 +508,7 @@ def _precondition(action: str, state: SOSCellViewState):
         if state.state != "O" or state.change != "-":
             return "blocked", "Cancel checkout requires this workarea's checkout to be saved and unmodified."
         return None
-    if state.object_type != "p" or state.revision == "?":
+    if state.object_type != "p" or state.revision == "?" or state.rso != "-":
         return "blocked", "Target must be an existing managed SOS package, not a reference or unmanaged object."
     if state.lock != "-":
         return "blocked", "Target is locked in another workarea, or lock status is unavailable."
@@ -411,7 +528,8 @@ def _precondition(action: str, state: SOSCellViewState):
 
 
 def _verified(action: str, before: SOSCellViewState, after: SOSCellViewState) -> bool:
-    if after.object_type != "p" or after.lock != "-" or after.revision == "?":
+    if (after.object_type != "p" or after.lock != "-" or after.rso != "-"
+            or after.revision == "?"):
         return False
     if action == "co":
         return after.state == "O" and after.change in {"-", "M"}
