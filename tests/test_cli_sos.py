@@ -141,3 +141,78 @@ def test_reconcile_connection_failure_preserves_unknown(monkeypatch, capsys, tmp
     result = json.loads(capsys.readouterr().out)
     assert result["outcome"] == "unknown" and result["assessment"] == "unavailable"
     assert not result["operation_confirmed"] and "CIW busy" in result["diagnostics"][0]
+
+
+@pytest.mark.parametrize("action,method", [
+    ("session-doctor", "diagnose_session_cellview"),
+    ("lock-info", "lock_info_cellview"),
+])
+def test_cli_routes_session_and_lock_queries(monkeypatch, capsys, action, method):
+    calls = []
+    payload = {"ok": True, "action": action.replace("-", "_"), "outcome": "success"}
+
+    class Result:
+        def to_dict(self):
+            return payload
+
+    def invoke(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Result() if action == "lock-info" else payload
+
+    monkeypatch.setattr(
+        virtuoso_bridge.VirtuosoClient,
+        "from_env",
+        lambda **kw: SimpleNamespace(sos=SimpleNamespace(**{method: invoke})),
+    )
+    monkeypatch.setattr(cli, "set_runtime_env_file", lambda value: None)
+    assert cli.main(["sos", action, "lib", "cell", "schematic", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == payload
+    assert calls == [(('lib', 'cell', 'schematic'), {'timeout': 60})]
+
+
+def test_cli_lock_query_failure_is_structured_blocked(monkeypatch, capsys):
+    def invoke(*args, **kwargs):
+        raise RuntimeError("malformed server lock record")
+
+    monkeypatch.setattr(
+        virtuoso_bridge.VirtuosoClient,
+        "from_env",
+        lambda **kw: SimpleNamespace(
+            sos=SimpleNamespace(lock_info_cellview=invoke),
+        ),
+    )
+    monkeypatch.setattr(cli, "set_runtime_env_file", lambda value: None)
+    assert cli.main([
+        "sos", "lock-info", "lib", "cell", "schematic", "--json",
+    ]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["outcome"] == "blocked"
+    assert result["lock"] is None
+    assert result["diagnostics"] == ["malformed server lock record"]
+
+
+def test_cli_session_restart_requires_confirmation_and_routes_force(monkeypatch, capsys):
+    calls = []
+
+    def invoke(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"ok": True, "action": "session_restart", "outcome": "dry_run"}
+
+    monkeypatch.setattr(
+        virtuoso_bridge.VirtuosoClient,
+        "from_env",
+        lambda **kw: SimpleNamespace(sos=SimpleNamespace(restart_session_cellview=invoke)),
+    )
+    monkeypatch.setattr(cli, "set_runtime_env_file", lambda value: None)
+    with pytest.raises(ValueError, match="requires --dry-run or --yes"):
+        cli.main(["sos", "session-restart", "lib", "cell", "schematic"])
+    assert not calls
+
+    assert cli.main([
+        "sos", "session-restart", "lib", "cell", "schematic", "--dry-run",
+        "--force-cadence-disconnect", "--json",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "dry_run"
+    assert calls == [(('lib', 'cell', 'schematic'), {
+        'dry_run': True, 'force_cadence_disconnect': True, 'timeout': 60,
+    })]

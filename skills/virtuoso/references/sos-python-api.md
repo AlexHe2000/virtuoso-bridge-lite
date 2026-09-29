@@ -42,6 +42,11 @@ checkin = client.sos.checkin_cellview(
 initial = client.sos.register_cellview(
     "LIB", "NEW_CELL", "schematic", message="Initial version", dry_run=True,
 )
+session = client.sos.diagnose_session_cellview("LIB", "CELL", "schematic")
+lock = client.sos.lock_info_cellview("LIB", "CELL", "schematic")
+restart = client.sos.restart_session_cellview(
+    "LIB", "CELL", "schematic", dry_run=True,
+)
 ```
 
 `status_cellview` is read-only for any resolvable view. Writes are limited to
@@ -77,6 +82,38 @@ dispatch is `unknown`: Bridge queries fresh SOS state but never resends the
 mutation and never claims that a matching state proves which request completed.
 Use `reconcile_cellview(..., receipt=previous_result)` for a read-only follow-up.
 
+### Session health and lock ownership
+
+`diagnose_session_cellview` begins with `soscmd query is_running`, which does not
+start a stopped workarea session. For an existing session it reports server
+connectivity, GUI mode, project/server/RSO identity, an exact server-queried
+object record, and whether native `status` still works. This distinguishes a
+healthy client from a stale client whose server queries work but native status
+updates are denied.
+
+`lock_info_cellview` requests one exact object from the server without `-ucl`
+and reports whether its checkout belongs to the current workarea, another
+workarea, no server lock, or no checkout. It includes the SOS-reported owner,
+checkout time, path, and workarea fields without scanning the project or writing
+a history report.
+
+SOS returns only available attributes for `nobjstatus -ga...`. `Modified` and
+`OutOfDate` remain mandatory binary flags; `CiModified` is treated as false
+when omitted by older SOS package records, and is still rejected if present
+with a value other than `0` or `1`. Lock metadata that is unavailable for an
+unlocked object is reported as empty. A malformed lock record makes the CLI
+return a structured `blocked` result rather than a traceback.
+
+`restart_session_cellview` is recovery for an unhealthy, already-running SOS
+session. A healthy session returns `noop`; a stopped or unidentified session is
+not started implicitly. Recovery is blocked for unsaved buffers and whenever a
+Maestro session is active in the connected CIW. It first tries normal
+`exitsos`. The force form is available only when
+`force_cadence_disconnect=True`, after a confirmed normal-exit refusal. A lost
+reply is `unknown` and is never retried. Successful recovery starts SOS through
+one read-only exact-object query and requires both server-object and native
+status verification.
+
 ## CLI
 
 ```bash
@@ -86,12 +123,21 @@ virtuoso-bridge sos cancel-co LIB CELL schematic --dry-run -p lab --json
 virtuoso-bridge sos ci LIB CELL schematic -m "Fix gain" --dry-run -p lab --json
 virtuoso-bridge sos register LIB NEW_CELL schematic -m "Initial version" --dry-run -p lab --json
 virtuoso-bridge sos doctor LIB CELL schematic -p lab --json
+virtuoso-bridge sos session-doctor LIB CELL schematic -p lab --json
+virtuoso-bridge sos lock-info LIB CELL schematic -p lab --json
+virtuoso-bridge sos session-restart LIB CELL schematic --dry-run -p lab --json
+virtuoso-bridge sos session-restart LIB CELL schematic --yes \
+  --force-cadence-disconnect -p lab --json
 virtuoso-bridge sos reconcile LIB CELL schematic --receipt unknown.json -p lab --json
 ```
 
 CLI exit codes are `0` for success/noop/dry-run, `1` for blocked or failed, and
 `3` for unknown. `doctor` is read-only and does not acquire a license, save,
 checkout, checkin, run history, or create diff reports.
+`session-restart` requires `--dry-run` or `--yes`; forced Cadence disconnect is
+never implied by `--yes` and must be named separately. Use it only on a
+dedicated idle CIW, because `exitsos -F` disconnects Cadence from that workarea's
+SOS session.
 
 ## Ordinary SOS Files
 

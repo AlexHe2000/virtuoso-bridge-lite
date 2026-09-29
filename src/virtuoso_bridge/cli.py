@@ -1748,7 +1748,8 @@ def cli_screenshot() -> int:
 def cli_sos(*, action: str, lib: str, cell: str, view: str,
             message: str | None = None, dry_run: bool = False,
             timeout: float = 60, soscmd: str | None = None,
-            receipt: str | None = None, json_output: bool = False) -> int:
+            receipt: str | None = None, json_output: bool = False,
+            yes: bool = False, force_cadence_disconnect: bool = False) -> int:
     """Run one explicit SOS cellview operation."""
     import json
     import sys
@@ -1810,6 +1811,30 @@ def cli_sos(*, action: str, lib: str, cell: str, view: str,
                 ).to_dict()
             elif action == "doctor":
                 payload = client.sos.diagnose_cellview(lib, cell, view, **options)
+            elif action == "session-doctor":
+                payload = client.sos.diagnose_session_cellview(lib, cell, view, **options)
+            elif action == "lock-info":
+                try:
+                    payload = client.sos.lock_info_cellview(
+                        lib, cell, view, **options,
+                    ).to_dict()
+                except Exception as exc:
+                    payload = {
+                        "ok": False,
+                        "action": "lock_info",
+                        "outcome": "blocked",
+                        "target": {"lib": lib, "cell": cell, "view": view},
+                        "before": None,
+                        "lock": None,
+                        "diagnostics": [str(exc)],
+                    }
+            elif action == "session-restart":
+                if not dry_run and not yes:
+                    raise ValueError("SOS session-restart requires --dry-run or --yes")
+                payload = client.sos.restart_session_cellview(
+                    lib, cell, view, dry_run=dry_run,
+                    force_cadence_disconnect=force_cadence_disconnect, **options,
+                )
             else:
                 payload = client.sos.reconcile_cellview(
                     lib, cell, view, receipt=previous, **options,
@@ -1842,6 +1867,22 @@ def _print_sos_result(payload: dict, *, fallback: tuple[str, str, str] = ("", ""
             f"{state_label} revision={before.get('revision')} "
             f"change={before.get('change')} lock={before.get('lock')}"
         )
+    session = payload.get("session") or payload.get("session_after") or {}
+    if session:
+        print(
+            "session: "
+            f"running={session.get('running')} offline={session.get('offline_code')} "
+            f"mode={session.get('nowin_code')} project={session.get('project', '')}"
+        )
+    lock = payload.get("lock") or {}
+    if lock:
+        print(
+            "lock: "
+            f"scope={lock.get('scope')} owner={lock.get('owner', '')} "
+            f"workarea={lock.get('workarea', '')} path={lock.get('checkout_path', '')}"
+        )
+    for check in payload.get("checks") or []:
+        print(f"check: {check.get('name')}: {'ok' if check.get('ok') else 'blocked'}: {check.get('detail')}")
     for diagnostic in payload.get("diagnostics") or []:
         print(f"diagnostic: {diagnostic}")
 
@@ -1854,7 +1895,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     sp_sos = subparsers.add_parser("sos", help="Operate on one SOS-managed cellview")
     sos_actions = sp_sos.add_subparsers(dest="sos_action", required=True)
-    for action in ("status", "co", "cancel-co", "ci", "register", "doctor", "reconcile"):
+    for action in (
+        "status", "co", "cancel-co", "ci", "register", "doctor", "reconcile",
+        "session-doctor", "session-restart", "lock-info",
+    ):
         sub = sos_actions.add_parser(action)
         sub.add_argument("lib")
         sub.add_argument("cell")
@@ -1865,8 +1909,15 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--timeout", type=float, default=60)
         sub.add_argument("--soscmd", default=None,
                          help="SOS executable or site wrapper on the GUI host")
-        if action in {"co", "cancel-co", "ci", "register"}:
+        if action in {"co", "cancel-co", "ci", "register", "session-restart"}:
             sub.add_argument("--dry-run", action="store_true")
+        if action == "session-restart":
+            sub.add_argument("--yes", action="store_true",
+                             help="Confirm one controlled SOS session restart")
+            sub.add_argument(
+                "--force-cadence-disconnect", action="store_true",
+                help="Allow exitsos -F after a confirmed normal-exit refusal",
+            )
         if action in {"ci", "register"}:
             sub.add_argument("-m", "--message", required=True)
         if action == "reconcile":
@@ -2274,6 +2325,8 @@ def main(argv: list[str] | None = None) -> int:
             soscmd=getattr(args, "soscmd", None),
             receipt=getattr(args, "receipt", None),
             json_output=getattr(args, "json", False),
+            yes=getattr(args, "yes", False),
+            force_cadence_disconnect=getattr(args, "force_cadence_disconnect", False),
         ),
         "load": lambda: cli_load(
             file=getattr(args, "file"),

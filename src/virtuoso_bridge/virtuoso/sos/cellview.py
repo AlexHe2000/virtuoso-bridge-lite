@@ -307,10 +307,17 @@ def _native_result(owner: VirtuosoClient, timeout: float) -> list:
 
 
 def _maestro_active(owner: VirtuosoClient, timeout: float) -> bool:
-    result = _decode(owner.execute_skill(f'''prog(())
+    result = _decode(owner.execute_skill(f'''prog((vbSessions vbSessionsResult)
   ; {_MAESTRO_PROBE_MARKER}
-  return(list("ok" if(isCallable('maeGetSessions) && maeGetSessions() then t else nil)))
+  when(isCallable('maeGetSessions)
+    vbSessionsResult=errset(maeGetSessions() nil)
+    unless(vbSessionsResult return(list("failed" "maeGetSessions failed.")))
+    vbSessions=car(vbSessionsResult))
+  return(list("ok" if(vbSessions then t else nil)))
 )''', timeout=timeout))
+    if (len(result) == 2 and result[0] == "failed"
+            and isinstance(result[1], str)):
+        raise RuntimeError(result[1])
     if len(result) != 2 or result[0] != "ok" or result[1] not in {True, None}:
         raise RuntimeError("Malformed Maestro session probe result.")
     return result[1] is True
@@ -328,14 +335,45 @@ def _decode(result) -> list:
     return value
 
 
+def _resolve_ciw_target(
+    owner: VirtuosoClient,
+    target: SOSCellViewTarget,
+    timeout: float,
+    *,
+    required_action: str = "status",
+) -> SOSCellViewTarget:
+    """Resolve one cellview in CIW without invoking an SOS command."""
+    resolved = _decode(owner.execute_skill(
+        _skill(target, required_action=required_action), timeout=timeout,
+    ))
+    if resolved[0] != "ok":
+        if len(resolved) != 2 or not isinstance(resolved[1], str):
+            raise RuntimeError("Malformed cellview resolution error.")
+        raise _ObjectUnavailable(resolved[1])
+    if len(resolved) != 5 or (resolved[4] is not None and resolved[4] is not True):
+        raise RuntimeError("Malformed cellview resolution result.")
+    directory, master = (_absolute_path(value) for value in resolved[1:3])
+    if master == directory or posixpath.commonpath([directory, master]) != directory:
+        raise RuntimeError("Resolved master file is outside the cellview directory.")
+    if resolved[3] is not None and not isinstance(resolved[3], str):
+        raise RuntimeError("Malformed cellview type.")
+    return replace(
+        target,
+        directory=directory,
+        master=master,
+        view_type=resolved[3] or "",
+        unsaved=(resolved[4] is True) if resolved[3] in _OA_TYPES else None,
+    )
+
+
 _NOBJSTATUS_ATTRIBUTES = (
     "-gaRevision", "-gaCurrentVer", "-gaModified", "-gaCiModified", "-gaOutOfDate",
     "-gaReference",
 )
 
 
-def _parse_nobjstatus(output: str, target: SOSCellViewTarget) -> SOSCellViewState:
-    """Parse one length-prefixed, server-queried SOS nobjstatus record."""
+def _parse_nobjstatus_record(output: str) -> tuple[str, str, str, dict[str, str]]:
+    """Parse one length-prefixed SOS nobjstatus record without interpreting it."""
     payload = output.encode("utf-8")
     offset = 0
 
@@ -356,8 +394,6 @@ def _parse_nobjstatus(output: str, target: SOSCellViewTarget) -> SOSCellViewStat
         raise RuntimeError("Malformed SOS nobjstatus record marker.")
 
     path = read_line("object path").decode("utf-8", "strict")
-    if path not in {target.path, "./" + target.path}:
-        raise RuntimeError("SOS nobjstatus returned a different object path.")
     status_code = read_line("status code").decode("ascii", "strict")
     type_code = read_line("object type").decode("ascii", "strict")
 
@@ -387,6 +423,15 @@ def _parse_nobjstatus(output: str, target: SOSCellViewTarget) -> SOSCellViewStat
             raise RuntimeError("Duplicate or empty SOS nobjstatus attribute.")
         attributes[key] = value
 
+    return path, status_code, type_code, attributes
+
+
+def _parse_nobjstatus(output: str, target: SOSCellViewTarget) -> SOSCellViewState:
+    """Parse one length-prefixed, server-queried SOS nobjstatus record."""
+    path, status_code, type_code, attributes = _parse_nobjstatus_record(output)
+    if path not in {target.path, "./" + target.path}:
+        raise RuntimeError("SOS nobjstatus returned a different object path.")
+
     object_types = {"1": "f", "2": "d", "3": "p"}
     object_type = object_types.get(type_code)
     if object_type is None:
@@ -405,11 +450,15 @@ def _parse_nobjstatus(output: str, target: SOSCellViewTarget) -> SOSCellViewStat
         raise RuntimeError(f"Unsupported SOS nobjstatus state: {status_code!r}.")
 
     flags = {}
-    for name in ("Modified", "CiModified", "OutOfDate"):
+    for name in ("Modified", "OutOfDate"):
         value = attributes.get(name)
         if value not in {"0", "1"}:
             raise RuntimeError(f"SOS nobjstatus is missing a valid {name} flag.")
         flags[name] = value
+    ci_modified = attributes.get("CiModified", "0")
+    if ci_modified not in {"0", "1"}:
+        raise RuntimeError("SOS nobjstatus returned an invalid CiModified flag.")
+    flags["CiModified"] = ci_modified
     if "Reference" not in attributes:
         raise RuntimeError("SOS nobjstatus is missing the Reference attribute.")
     revision = attributes.get("Revision") or attributes.get("CurrentVer")
@@ -604,36 +653,28 @@ def operate_cellview(
     try:
         if sos_runner(owner) is None:
             return report("blocked", "SOS requires a GUI-host SSH runner or an explicitly local POSIX client; plain TCP/native Windows local is unsupported.")
-        resolved = _decode(owner.execute_skill(_skill(target, required_action=action), timeout=timeout))
-        if resolved[0] != "ok":
-            if len(resolved) != 2 or not isinstance(resolved[1], str):
-                raise RuntimeError("Malformed cellview resolution error.")
-            return report(resolved[0], resolved[1])
-        if len(resolved) != 5 or (resolved[4] is not None and resolved[4] is not True):
-            raise RuntimeError("Malformed cellview resolution result.")
-        directory, master = (_absolute_path(v) for v in resolved[1:3])
-        if master == directory or posixpath.commonpath([directory, master]) != directory:
-            raise RuntimeError("Resolved master file is outside the cellview directory.")
-        if resolved[3] is not None and not isinstance(resolved[3], str):
-            raise RuntimeError("Malformed cellview type.")
-        target = replace(target, directory=directory, master=master,
-                         view_type=resolved[3] or "",
-                         unsaved=(resolved[4] is True) if resolved[3] in _OA_TYPES else None)
-        if action in {"cancel_co", "ci", "register"} and _is_calibre_target(directory, master):
+        target = _resolve_ciw_target(owner, target, timeout, required_action=action)
+        if action in {"cancel_co", "ci", "register"} and _is_calibre_target(
+            target.directory, target.master,
+        ):
             return report("blocked", "Resolved path belongs to a Calibre-related target; mutation is prohibited.")
         if action == "register":
             decision = _target_precondition(target)
             if decision:
                 return report(*decision)
         executable = resolve_soscmd(owner, soscmd, timeout=timeout)
-        probe = SOSWorkarea(owner, directory, soscmd=executable)
+        probe = SOSWorkarea(owner, target.directory, soscmd=executable)
         found = probe._run("findwaroot", timeout=timeout)
         if found.returncode:
             raise RuntimeError(found.stderr.strip() or found.stdout.strip() or "SOS workarea not found.")
         workarea = _absolute_path(found.stdout.strip())
-        if directory == workarea or posixpath.commonpath([directory, workarea]) != workarea:
+        if (target.directory == workarea
+                or posixpath.commonpath([target.directory, workarea]) != workarea):
             raise RuntimeError("Resolved cellview is outside the returned SOS workarea.")
-        target = replace(target, workarea=workarea, path=posixpath.relpath(directory, workarea))
+        target = replace(
+            target, workarea=workarea,
+            path=posixpath.relpath(target.directory, workarea),
+        )
         area = SOSWorkarea(owner, workarea, soscmd=executable)
         if action in {"co", "cancel_co", "ci"}:
             decision = _target_precondition(target)
