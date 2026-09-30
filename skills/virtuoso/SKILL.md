@@ -326,6 +326,7 @@ Load on demand — each contains detailed API docs and edge-case guidance:
 | `references/simulation-flow.md` | **Standard simulation flow** — ordered lifecycle, pitfalls, optimization loops |
 | `references/netlist.md` | CDL/Spectre netlist formats, spiceIn import |
 | `references/troubleshooting.md` | Known gotchas, GUI blocking, CDF quirks, connection issues |
+| `references/shared-ciw-dialogs.md` | Process-scoped read-only dialog inspection, shared-CIW guard, and explicit recovery boundaries |
 | `references/cellview-on-disk-layout.md` | What's inside each view on disk (`sch.oa`, `data.dm` binary format, `maestro.sdb`/`active.state` XML skeleton, lock files, SOS markers); which files are text-editable vs must go through DFII API |
 | `references/schematic-recreation.md` | Recreate schematic from existing design (grid layout, diff pair conventions) |
 | `references/batch-netlist-si.md` | Generate netlists without Maestro using si batch translator |
@@ -598,9 +599,9 @@ results = client.maestro.read_results(
 
 # 5. If run_and_wait times out while a modal is visible, recover outside the
 #    blocked SKILL channel, then diagnose before deciding whether to rerun:
-#    $ virtuoso-bridge dismiss-dialog
+#    $ virtuoso-bridge inspect-dialogs --pid PID --json
 #    $ virtuoso-bridge list-windows --top-level --json
-#    $ virtuoso-bridge dismiss-window WINDOW_ID --action enter
+#    Only send a key to a verified explicit window/action with user authorization.
 ```
 
 ### Output read/export guardrails (collision-safe)
@@ -728,29 +729,33 @@ When `execute_skill()` times out, possible causes:
 
 | Cause | Symptom | Fix |
 |-------|---------|-----|
-| **Modal dialog** | GUI popup blocking CIW | `virtuoso-bridge dismiss-dialog` |
-| **Auto dialog finder missed a modal** | GUI popup visible, SKILL channel blocked | `virtuoso-bridge list-windows --top-level --json`, then `virtuoso-bridge dismiss-window WINDOW_ID --action enter` |
+| **Modal dialog** | GUI popup blocking CIW | `virtuoso-bridge inspect-dialogs --pid PID --json`; preserve user dialogs |
+| **Unknown candidate window** | GUI popup visible, SKILL channel blocked | Inspect out-of-band and ask the user; do not guess an action |
 | **Long operation** | Simulation or netlist running | Wait, or use `?waitUntilDone nil` |
-| **CIW input prompt** | CIW waiting for typed input | `dismiss-dialog` (sends Enter) |
+| **CIW input prompt** | CIW waiting for typed input | Ask the user to complete their input; do not inject Enter |
 | **Bridge disconnected** | All calls fail immediately | `virtuoso-bridge restart` |
 
 **Dialog recovery (bypasses SKILL, uses X11 directly):**
 
 ```bash
-# Find and dismiss all blocking Virtuoso dialogs
-virtuoso-bridge dismiss-dialog
+# Inspect the selected CIW without changing the GUI
+virtuoso-bridge inspect-dialogs --pid PID --json
 
-# Inspect X11 windows and dismiss one explicitly
+# With explicit authorization for this exact window and action:
 virtuoso-bridge list-windows --top-level --json
 virtuoso-bridge dismiss-window 0x4203583 --action enter
 
 # From Python
-client.dismiss_dialog()
+client.dialogs.inspect(pid=PID)
 ```
 
-Uses `xwininfo` to find virtuoso-owned dialog windows and `XTestFakeKeyEvent` to send the requested key action. Works even when the SKILL channel is completely stuck.
+Inspection bypasses SKILL using SSH/X11. See `references/shared-ciw-dialogs.md`
+for ownership checks and the opt-in per-client guard. Bulk dismissal requires
+explicit legacy opt-in and must not be used as shared-CIW automatic recovery.
 
-**Prevention:** Always `dbSave(cv)` before `hiCloseWindow(win)`. Never use `?waitUntilDone t` in simulation calls. Add dialog-recovery in simulation loops (see "Run a simulation" section).
+**Prevention:** Resolve unsaved changes before closing windows, and use asynchronous
+simulation callbacks. In shared CIWs enable the read-only guard; never automatically
+save/discard human edits or dismiss their forms.
 
 ## Related skills
 

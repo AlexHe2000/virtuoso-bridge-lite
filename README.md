@@ -314,7 +314,8 @@ All commands take `-p PROFILE` / `--env PATH` to pick a non-default config; run 
 | **Interaction / diagnostics** | |
 | `windows` | List all open Virtuoso windows (number + name) |
 | `screenshot [ciw\|current\|N] [-o DIR\|FILE]` | Capture a window; defaults to the user artifact screenshots directory |
-| `dismiss-dialog` | X11 path: find and dismiss blocking GUI dialogs (saves you when SKILL channel deadlocks on a modal) |
+| `inspect-dialogs --pid PID` | Read-only process-scoped X11 blocker inspection; supports `--json`, profile and explicit DISPLAY/CIW window |
+| `dismiss-dialog --legacy-bulk` | Explicit opt-in legacy bulk dismissal; unsuitable for shared CIWs |
 | `list-windows [--top-level] [--json]` | X11 path: enumerate Virtuoso windows; `--top-level` returns one deduplicated entry per frame for CIW selection |
 | `bootstrap --window WINDOW_ID` | Opt-in X11 first load: inject only the generated `load(...)` into one explicit, verified CIW |
 | `dismiss-window WINDOW_ID [--action enter\|escape\|alt-y\|alt-n]` | X11 path: send an explicit action to one window ID returned by `list-windows` |

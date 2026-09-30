@@ -1062,13 +1062,16 @@ def cli_eval(*, skill: str | None, stdin: bool, timeout: int = 60,
     return 0 if result.status == ExecutionStatus.SUCCESS else 1
 
 
-def cli_dismiss_dialog() -> int:
+def cli_dismiss_dialog(*, legacy_bulk: bool = False) -> int:
     """Find and dismiss blocking Virtuoso GUI dialogs via X11."""
+    if not legacy_bulk:
+        print("Bulk dismissal is disabled. Use inspect-dialogs --pid PID, then an explicitly authorized dismiss-window action. --legacy-bulk enables unsafe legacy behavior.")
+        return 1
     _load_cli_env()
     from virtuoso_bridge.virtuoso import x11
     runner, user = _make_ssh_runner()
 
-    dialogs = x11.dismiss_dialogs(runner, user, profile=_get_cli_profile())
+    dialogs = x11.dismiss_dialogs(runner, user, profile=_get_cli_profile(), allow_legacy_bulk=True)
     if not dialogs:
         print("No dialog windows found.")
         return 0
@@ -1080,7 +1083,42 @@ def cli_dismiss_dialog() -> int:
             print(f"  Dismissed: {d['dismissed']}")
         elif "title" in d:
             print(f'  Found: "{d["title"]}" at ({d.get("x",0)},{d.get("y",0)})')
-    return 0
+    return 1 if any("error" in d or d.get("still_mapped") for d in dialogs) else 0
+
+
+def cli_inspect_dialogs(
+    *, pid: int, display: str | None = None, ciw_window: str | None = None,
+    timeout: float = 15, json_output: bool = False,
+) -> int:
+    """Read one explicit GUI process; never construct a SKILL client."""
+    import json
+    from virtuoso_bridge.virtuoso import x11
+    from virtuoso_bridge.virtuoso.dialogs import DialogInspection, DialogTarget, parse_inspection
+
+    try:
+        target = DialogTarget(pid=pid, display=display, ciw_window=ciw_window)
+    except ValueError as exc:
+        print(f"Invalid inspection target: {exc}", file=sys.stderr)
+        return 1
+    try:
+        load_vb_env()
+        runner, user = _make_ssh_runner()
+        payload = x11.inspect_dialogs(
+            runner, user, pid=pid, display=display, ciw_window=ciw_window,
+            profile=_get_cli_profile(), timeout=timeout,
+        )
+        report = parse_inspection(payload, target)
+    except (Exception, SystemExit) as exc:
+        report = DialogInspection(status="indeterminate", target=target, diagnostics=[str(exc)])
+    if json_output:
+        print(json.dumps(report.model_dump(), indent=2, ensure_ascii=False))
+    else:
+        print(f"CIW {report.target.pid}: {report.status}")
+        for item in report.dialogs:
+            print(f"  {item.get('window_id', '?')}: {item.get('title') or '(untitled)'}")
+        for message in report.diagnostics:
+            print(f"  {message}")
+    return {"clear": 0, "blocked": 2, "indeterminate": 1}[report.status]
 
 
 def cli_list_windows(*, json_output: bool = False, top_level: bool = False) -> int:
@@ -1118,7 +1156,9 @@ def cli_list_windows(*, json_output: bool = False, top_level: bool = False) -> i
     return 0
 
 
-def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
+def cli_dismiss_window(
+    *, window_id: str, action: str = "enter", display: str | None = None,
+) -> int:
     """Dismiss one explicit X11 window id via XTest."""
     _load_cli_env()
     from virtuoso_bridge.virtuoso import x11
@@ -1129,6 +1169,7 @@ def cli_dismiss_window(*, window_id: str, action: str = "enter") -> int:
         user,
         window_id,
         action=action,
+        display=display,
         profile=_get_cli_profile(),
     )
     if not results:
@@ -2035,6 +2076,17 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Connection profile")
     sp_dismiss.add_argument("--env", default=None,
                             help="Explicit .env file path (highest priority)")
+    sp_dismiss.add_argument("--legacy-bulk", action="store_true",
+                            help="Explicitly enable unsafe legacy bulk dismissal")
+
+    sp_inspect = subparsers.add_parser("inspect-dialogs", help="Read-only dialog inspection of one explicit CIW process")
+    sp_inspect.add_argument("--pid", type=int, required=True, help="Virtuoso process PID on the GUI host")
+    sp_inspect.add_argument("--display", default=None, help="Optional expected DISPLAY; otherwise read from that PID")
+    sp_inspect.add_argument("--ciw-window", default=None, help="Optional expected CIW X11 window id")
+    sp_inspect.add_argument("--timeout", type=float, default=15, help="Inspection time budget in seconds")
+    sp_inspect.add_argument("--json", action="store_true", help="Output structured inspection")
+    sp_inspect.add_argument("-p", "--profile", default=None, help="Connection profile")
+    sp_inspect.add_argument("--env", default=None, help="Explicit .env file path")
 
     sp_list_windows = subparsers.add_parser(
         "list-windows", help="List Virtuoso-related X11 windows")
@@ -2053,6 +2105,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp_dismiss_window = subparsers.add_parser(
         "dismiss-window", help="Dismiss one explicit X11 window id")
     sp_dismiss_window.add_argument("window_id", help="X11 window id, e.g. 0x4203583")
+    sp_dismiss_window.add_argument(
+        "--display", default=None,
+        help="Exact X display from inspection; required for inspection-based recovery",
+    )
     sp_dismiss_window.add_argument(
         "--action",
         default="enter",
@@ -2339,7 +2395,11 @@ def main(argv: list[str] | None = None) -> int:
             timeout=getattr(args, "timeout", 60),
             quiet=getattr(args, "quiet", False),
         ),
-        "dismiss-dialog": cli_dismiss_dialog,
+        "dismiss-dialog": lambda: cli_dismiss_dialog(legacy_bulk=getattr(args, "legacy_bulk", False)),
+        "inspect-dialogs": lambda: cli_inspect_dialogs(
+            pid=args.pid, display=args.display, ciw_window=args.ciw_window,
+            timeout=args.timeout, json_output=getattr(args, "json", False),
+        ),
         "list-windows": lambda: cli_list_windows(
             json_output=getattr(args, "json", False),
             top_level=getattr(args, "top_level", False),
@@ -2347,6 +2407,7 @@ def main(argv: list[str] | None = None) -> int:
         "dismiss-window": lambda: cli_dismiss_window(
             window_id=getattr(args, "window_id"),
             action=getattr(args, "action", "enter"),
+            display=getattr(args, "display", None),
         ),
         "bootstrap": lambda: cli_bootstrap(
             window_id=getattr(args, "window"),

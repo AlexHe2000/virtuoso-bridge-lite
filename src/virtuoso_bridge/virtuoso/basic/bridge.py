@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -133,6 +134,9 @@ class VirtuosoClient(VirtuosoInterface):
 
         self.maestro = MaestroOps(self)
         self.sos = SOSOps(self)
+        from virtuoso_bridge.virtuoso.dialogs import DialogOps
+
+        self.dialogs = DialogOps(self)
         self._il_upload_cache: dict[str, tuple[str, str]] = {}
         # For connect retry when jump host adds latency
         self._has_jump_host = (
@@ -451,6 +455,41 @@ class VirtuosoClient(VirtuosoInterface):
         timeout: Optional[float] = None,
         *,
         retry_connect: bool = True,
+    ) -> VirtuosoResult:
+        """Execute once, optionally protected by a read-only shared-CIW guard.
+
+        Enable protection with ``client.dialogs.enable_guard()``. A preexisting
+        or unidentifiable dialog prevents transmission. Human actions can race
+        the preflight; failed in-flight operations are never replayed by the
+        guard. The daemon watchdog is unchanged.
+        """
+        if not self.dialogs.enabled:
+            return self._execute_skill_unguarded(skill_code, timeout, retry_connect=retry_connect)
+        started = time.monotonic()
+        budget = timeout if timeout is not None else self._timeout
+        if isinstance(budget, bool) or budget <= 0 or not math.isfinite(budget):
+            raise ValueError("timeout must be positive and finite")
+        blocked = self.dialogs.preflight(timeout=budget)
+        if blocked is not None:
+            blocked.execution_time = time.monotonic() - started
+            return blocked
+        remaining = budget - (time.monotonic() - started)
+        if remaining <= 0:
+            return VirtuosoResult(status=ExecutionStatus.ERROR,
+                                  errors=["Dialog preflight exhausted the request budget"],
+                                  metadata={"request_sent": False, "outcome": "not_started"},
+                                  execution_time=time.monotonic() - started)
+        # The legacy connect retry includes ECONNRESET after transmission.
+        # Shared mode must not replay a possibly accepted write request.
+        result = self._execute_skill_unguarded(skill_code, remaining, retry_connect=False)
+        result = self.dialogs.annotate_failure(
+            result, timeout=max(0, budget - (time.monotonic() - started)),
+        )
+        result.execution_time = time.monotonic() - started
+        return result
+
+    def _execute_skill_unguarded(
+        self, skill_code: str, timeout: Optional[float] = None, *, retry_connect: bool = True,
     ) -> VirtuosoResult:
         """Execute SKILL code in Virtuoso via the RAMIC Bridge daemon.
 
@@ -864,15 +903,19 @@ let((result winName ciwNum)
 
     # -- X11 dialog recovery (bypasses SKILL channel) ----------------------
 
-    def dismiss_dialog(self, display: str | None = None) -> list[dict]:
-        """Find and dismiss blocking GUI dialogs via X11.
+    def dismiss_dialog(self, display: str | None = None, *, allow_legacy_bulk: bool = False) -> list[dict]:
+        """Explicit opt-in legacy bulk dismissal, refused in shared mode.
 
-        Use when execute_skill() times out due to a modal dialog blocking CIW.
-        Works via direct SSH + X11, independent of the SKILL channel.
+        Prefer read-only ``dialogs.inspect()``. This legacy action can affect
+        human/unrelated dialogs and must not be used as implicit recovery.
         """
+        if self.dialogs.enabled:
+            return [{"error": "Bulk dismissal is refused while the shared CIW guard is enabled; user dialogs must be preserved."}]
+        if not allow_legacy_bulk:
+            return [{"error": "Bulk dismissal requires explicit allow_legacy_bulk=True. Prefer dialogs.inspect() and an authorized explicit window/action."}]
         load_vb_env()
         from virtuoso_bridge.virtuoso import x11
-        runner = self.ssh_runner
+        runner = self.gui_runner
         if runner is None:
             # Local mode: x11.dismiss_dialogs accepts runner=None and runs
             # the helper as a local subprocess.  user is only used to
@@ -882,7 +925,7 @@ let((result winName ciwNum)
         else:
             user = runner.user or os.getenv("VB_REMOTE_USER", "")
         profile = getattr(self._tunnel, "_profile", None) if self._tunnel else None
-        return x11.dismiss_dialogs(runner, user, display, profile=profile)
+        return x11.dismiss_dialogs(runner, user, display, profile=profile, allow_legacy_bulk=True)
 
     # -- file transfer (delegates to tunnel) --------------------------------
 
@@ -1709,7 +1752,7 @@ let((result winName ciwNum)
             )
         return caps
 
-    def _ensure_daemon_capabilities(self, deadline: float) -> dict[str, Any]:
+    def _ensure_daemon_capabilities(self, deadline: float, *, refresh: bool = False) -> dict[str, Any]:
         """Perform the side-effect-free capability handshake exactly once.
 
         The hello request carries NO ``skill`` field, so nothing can execute
@@ -1722,7 +1765,7 @@ let((result winName ciwNum)
         ``ConnectionRefusedError``/``OSError`` propagate so callers can apply
         their normal connect-retry policy.
         """
-        if self._daemon_caps is not None:
+        if self._daemon_caps is not None and not refresh:
             return self._daemon_caps
         payload = self._build_hello_payload()
         nonce = payload["nonce"]

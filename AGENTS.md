@@ -363,11 +363,12 @@ virtuoso-bridge export-visio LIB CELL -o out.vsdx  # Windows + Visio/pywin32 sch
                                                    #   --include-body-pins       to draw NMOS/PMOS bulk (B) nets
                                                    #   --stencil PATH            override circuit.vss location
 virtuoso-bridge screenshot      # screenshot CIW to the user artifact directory
-virtuoso-bridge dismiss-dialog  # dismiss blocking GUI dialogs via X11
+virtuoso-bridge inspect-dialogs --pid PID --json  # read-only, process-scoped blocker check
+virtuoso-bridge dismiss-dialog --legacy-bulk  # explicit unsafe legacy bulk opt-in; not for shared CIWs
 virtuoso-bridge list-windows --json  # list Virtuoso-related X11 windows
 virtuoso-bridge list-windows --top-level --json  # one deduplicated entry per frame
 virtuoso-bridge bootstrap --window WINDOW_ID  # opt-in generated first load in one CIW
-virtuoso-bridge dismiss-window WINDOW_ID --action enter  # dismiss one explicit X11 window
+virtuoso-bridge dismiss-window WINDOW_ID --display DISPLAY --action enter  # explicit authorized window/display
 virtuoso-bridge skill-find <query>  # search SKILL functions by name (fuzzy/prefix/suffix/exact/regex)
 virtuoso-bridge skill-info <fn>  # get detailed More Info docs for a SKILL function
 virtuoso-bridge doc-info  # Virtuoso version + doc-root structure (once per host before doc work)

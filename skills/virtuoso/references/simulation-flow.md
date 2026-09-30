@@ -183,4 +183,7 @@ for val in ["1p", "2p", "5p", "10p"]:
     # ... process results ...
 ```
 
-Add dialog recovery (`client.dismiss_dialog()`) in the loop if GUI dialogs may appear.
+For shared CIWs, enable `client.dialogs.enable_guard()` before the loop. Preserve
+user dialogs and inspect through SSH/X11 rather than dismissing current forms.
+See [Shared CIW Dialog Protection](shared-ciw-dialogs.md). Failed/uncertain runs
+must be reconciled before any explicit retry.
