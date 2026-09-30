@@ -107,6 +107,85 @@ after the mutation. A timeout or connection interruption is never retried; if
 one read-back cannot confirm the requested state,
 `MaestroHistoryOutcomeUnknown` is raised.
 
+### Monte Carlo configuration and mismatch isolation
+
+The structured Monte Carlo API uses an explicit Maestro session and supports
+global (process), mismatch, or combined variation, deterministic seeds, sampling, result
+retention, and hierarchical DUT filters:
+
+```python
+from virtuoso_bridge.virtuoso.maestro import (
+    MonteCarloConfig,
+    MonteCarloModule,
+    MonteCarloModuleFilter,
+)
+
+config = MonteCarloConfig(
+    variation="mismatch",
+    points=200,
+    seed=12345,
+    save_mismatch=True,
+    module_filter=MonteCarloModuleFilter(
+        mode="include",
+        modules=(
+            MonteCarloModule(
+                test="TRAN",
+                instance="/I_CLK",
+                master="myLib/clk_gen/schematic",
+                kind="Master",
+            ),
+        ),
+    ),
+)
+
+# Validate the exact target and show the planned SKILL without changing it.
+plan = client.maestro.configure_monte_carlo(
+    config, session=session, dry_run=True,
+)
+
+# Apply once, save, then read back both options and run mode.
+applied = client.maestro.configure_monte_carlo(config, session=session)
+
+# Run and protect the resulting history from Maestro retention cleanup.
+run = client.maestro.run_monte_carlo_and_wait(
+    session=session, timeout=1800, lock_result=True,
+)
+
+# Export scalar results on the Virtuoso host, one CSV per corner.
+client.maestro.export_monte_carlo_results(
+    run.history, "/tmp/mc-results/", session=session,
+)
+```
+
+The exporter passes `?outputPath` to `axlWriteMonteCarloResultsCSV`.  IC6.1.8's
+installed reference table incorrectly labels this keyword as `?outputName`,
+while both the installed example and the executable function require
+`?outputPath`.
+
+`module_filter.mode="include"` applies mismatch only to the listed
+`dutSummary` entries; `"exclude"` applies mismatch everywhere except those
+entries. Process variation remains global. Use the same seed when comparing
+include/exclude configurations so differences are attributable to the module
+selection. Group or binary partitioning is usually faster than testing every
+module individually.
+
+Configuration reads and writes use the setup database for the explicit
+`session`: `axlGetRunOptions`/`axlGetRunOptionValue` for reads and
+`axlPutRunOption`/`axlSetRunOptionValue` for writes. This also handles optional
+run options such as `donominal`, `dutsummary`, and `ignoreflag` when they have
+not yet been materialized in a setup. It does not depend on the focused Maestro
+window or the session-global `ocnxlMonteCarloOptions` command.
+
+The target must be one editable Maestro GUI session with no pre-existing
+unsaved setup changes. Set `save=False` for temporary experiments; closing the
+session without saving discards those option changes. A timeout or socket loss
+is never retried. Configuration persistence that cannot be confirmed, or a run
+whose start/completion acknowledgement is lost, raises
+`MaestroMonteCarloOutcomeUnknown`; inspect the live setup or history list before
+deciding whether to issue another mutation. `get_monte_carlo_config()` returns
+`None` when no Monte Carlo run options are configured, rather than confusing
+that state with default values.
+
 **`timeout` kwarg** (`open_gui_session` / `close_gui_session` /
 `purge_maestro_cellviews`): bounds each blocking SKILL call in the
 helper. Default 60s — generous enough for cold maestro view opens

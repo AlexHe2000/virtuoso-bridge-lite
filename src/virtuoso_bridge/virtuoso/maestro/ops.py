@@ -27,6 +27,12 @@ from virtuoso_bridge.virtuoso.maestro.history import (
     set_history_lock,
     unlock_history,
 )
+from virtuoso_bridge.virtuoso.maestro.monte_carlo import (
+    configure_monte_carlo,
+    export_monte_carlo_results,
+    get_monte_carlo_config,
+    run_monte_carlo_and_wait,
+)
 from virtuoso_bridge.virtuoso.maestro.reader import (
     export_waveform,
     get_session_state,
@@ -111,6 +117,12 @@ class MaestroOps:
     set_history_lock = _client_method(set_history_lock)
     lock_history = _client_method(lock_history)
     unlock_history = _client_method(unlock_history)
+
+    # Monte Carlo configuration, execution, and export
+    get_monte_carlo_config = _client_method(get_monte_carlo_config)
+    configure_monte_carlo = _client_method(configure_monte_carlo)
+    run_monte_carlo_and_wait = _client_method(run_monte_carlo_and_wait)
+    export_monte_carlo_results = _client_method(export_monte_carlo_results)
 
     # Read results and waveforms
     snapshot = _client_method(snapshot)
