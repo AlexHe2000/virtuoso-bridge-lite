@@ -336,7 +336,8 @@ def set_job_policy(client: VirtuosoClient, policy, *,
 
 
 def run_simulation(client: VirtuosoClient, *, session: str = "",
-                   callback: str = "", timeout: float | None = None) -> str:
+                   callback: str = "", run_mode: str = "",
+                   timeout: float | None = None) -> str:
     """maeRunSimulation — run simulation (async, returns immediately).
 
     Returns the history name (e.g. "Interactive.1").
@@ -344,6 +345,7 @@ def run_simulation(client: VirtuosoClient, *, session: str = "",
     Args:
         session: session name (default: current session)
         callback: SKILL procedure name to call when run finishes
+        run_mode: explicit Maestro run mode; empty preserves the Cadence default
         timeout: socket timeout for Maestro to accept the run request
     """
     parts = "maeRunSimulation("
@@ -351,6 +353,8 @@ def run_simulation(client: VirtuosoClient, *, session: str = "",
         parts += f'?session "{escape_skill_string(session)}" '
     if callback:
         parts += f'?callback "{escape_skill_string(callback)}" '
+    if run_mode:
+        parts += f'?runMode "{escape_skill_string(run_mode)}" '
     parts = parts.rstrip() + ")"
     return _q(client, parts, timeout=timeout)
 
@@ -489,7 +493,7 @@ def _try_recover_blocking_form(client: VirtuosoClient, info: dict[str, str]) -> 
 
 
 def run_and_wait(client: VirtuosoClient, *, session: str = "",
-                 timeout: int = 600) -> tuple[str, str]:
+                 run_mode: str = "", timeout: int = 600) -> tuple[str, str]:
     """Run simulation and wait for completion without blocking SKILL.
 
     Uses maeRunSimulation(?callback ...) to register a completion callback
@@ -535,6 +539,7 @@ procedure(_vb_sim_done_{nonce}(session runID)
     # maeRunSimulation returns the history name; use the remaining caller budget.
     history = run_simulation(client, session=session,
                              callback=f"_vb_sim_done_{nonce}",
+                             run_mode=run_mode,
                              timeout=remaining_timeout())
     history_name = _strip_skill_atom(history)
     if not history_name or history_name == "nil":
@@ -545,6 +550,7 @@ procedure(_vb_sim_done_{nonce}(session runID)
         if recovered:
             history = run_simulation(client, session=session,
                                      callback=f"_vb_sim_done_{nonce}",
+                                     run_mode=run_mode,
                                      timeout=remaining_timeout())
             history_name = _strip_skill_atom(history)
 

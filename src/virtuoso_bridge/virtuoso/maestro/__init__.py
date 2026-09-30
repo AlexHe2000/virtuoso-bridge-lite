@@ -19,6 +19,21 @@ from virtuoso_bridge.virtuoso.maestro.history import (
     set_history_lock,
     unlock_history,
 )
+from virtuoso_bridge.virtuoso.maestro.monte_carlo import (
+    MC_RUN_MODE,
+    MaestroMonteCarloError,
+    MaestroMonteCarloOutcomeUnknown,
+    MonteCarloConfig,
+    MonteCarloConfigureResult,
+    MonteCarloExportResult,
+    MonteCarloModule,
+    MonteCarloModuleFilter,
+    MonteCarloRunResult,
+    configure_monte_carlo,
+    export_monte_carlo_results,
+    get_monte_carlo_config,
+    run_monte_carlo_and_wait,
+)
 from virtuoso_bridge.virtuoso.maestro.reader import (
     snapshot,
     filter_sdb_xml,
@@ -99,6 +114,20 @@ __all__ = [
     "set_history_lock",
     "lock_history",
     "unlock_history",
+    # Monte Carlo
+    "MC_RUN_MODE",
+    "MaestroMonteCarloError",
+    "MaestroMonteCarloOutcomeUnknown",
+    "MonteCarloConfig",
+    "MonteCarloConfigureResult",
+    "MonteCarloExportResult",
+    "MonteCarloModule",
+    "MonteCarloModuleFilter",
+    "MonteCarloRunResult",
+    "configure_monte_carlo",
+    "export_monte_carlo_results",
+    "get_monte_carlo_config",
+    "run_monte_carlo_and_wait",
     # read — aggregator (pass output_root to also write disk dump)
     "snapshot",
     "MaestroSessionState",
