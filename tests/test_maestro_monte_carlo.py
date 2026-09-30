@@ -206,6 +206,23 @@ def test_config_rejects_known_or_case_duplicate_extra_options() -> None:
         MonteCarloConfig(extra_options={"futureOption": "1", "FUTUREOPTION": "2"})
 
 
+@pytest.mark.parametrize("value", ["session\n4", "history\x00", " output\x7f"])
+def test_public_names_reject_control_characters(value: str) -> None:
+    with pytest.raises(ValueError, match="non-empty string"):
+        get_monte_carlo_config(_Client(), value)
+
+
+@pytest.mark.parametrize("value", ["future\nvalue", "future\x00value"])
+def test_extra_option_values_reject_control_characters(value: str) -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        MonteCarloConfig(extra_options={"futureOption": value})
+
+
+def test_extra_option_names_reject_control_characters() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        MonteCarloConfig(extra_options={"future\nOption": "1"})
+
+
 def test_mutation_uses_explicit_session_setup_database() -> None:
     config = MonteCarloConfig(
         variation="mismatch",

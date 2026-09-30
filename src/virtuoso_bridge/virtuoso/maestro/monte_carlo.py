@@ -137,9 +137,13 @@ class MonteCarloConfig(BaseModel):
         normalized: dict[str, str] = {}
         normalized_names: set[str] = set()
         for name, option_value in value.items():
+            if not isinstance(name, str):
+                raise ValueError("extra option names must be strings")
             option_name = name.strip()
             lowered = option_name.lower()
-            if not option_name:
+            if not option_name or any(
+                ord(char) < 0x20 or ord(char) == 0x7F for char in option_name
+            ):
                 raise ValueError("extra option names must be non-empty")
             if lowered in _KNOWN_OPTIONS:
                 raise ValueError(f"extra option {option_name!r} duplicates a known option")
@@ -147,6 +151,7 @@ class MonteCarloConfig(BaseModel):
                 raise ValueError("extra option names must be unique ignoring case")
             if not isinstance(option_value, str):
                 raise ValueError("extra option values must be strings")
+            _require_skill_text(option_value, f"extra option {option_name!r} value")
             normalized_names.add(lowered)
             normalized[option_name] = option_value
         return normalized
@@ -201,10 +206,21 @@ class MonteCarloExportResult(BaseModel):
 
 
 def _require_name(value: str, label: str) -> str:
-    normalized = (value or "").strip()
-    if not normalized:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a non-empty string.")
+    normalized = value.strip()
+    if not normalized or any(ord(char) < 0x20 or ord(char) == 0x7F for char in normalized):
         raise ValueError(f"{label} must be a non-empty string.")
     return normalized
+
+
+def _require_skill_text(value: str, label: str) -> str:
+    """Reject controls that cannot safely occur in a SKILL string literal."""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string.")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(f"{label} cannot contain control characters")
+    return value
 
 
 def _skill_string(value: str) -> str:
