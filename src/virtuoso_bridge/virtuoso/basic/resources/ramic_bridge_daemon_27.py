@@ -470,18 +470,17 @@ def _safe_close_connection(conn):
     except socket.error:
         pass
 
-def watchdog_callback(expired=None, finished=None):
-    """Send the legacy SIGINT without making the response reader reusable."""
-    if finished is not None and finished.is_set():
-        return
-    if expired is not None and expired.is_set():
-        return
-    if expired is not None:
+def watchdog_callback(expired, finished, completion_lock):
+    # Timer.cancel() cannot stop a callback that already started. Keep the
+    # decision and signal inside the same lock used before releasing the lane.
+    with completion_lock:
+        if finished.is_set() or expired.is_set():
+            return
         expired.set()
-    try:
-        os.kill(virtuoso_pid, signal.SIGINT)
-    except Exception:
-        pass
+        try:
+            os.kill(virtuoso_pid, signal.SIGINT)
+        except Exception:
+            pass
 
 def read_until_delimiter(start_ok=b'\x02', start_err=b'\x15', end=b'\x1e'):
     """Read data from Virtuoso's stdout until specific delimiters are found."""
@@ -611,6 +610,7 @@ def _transmit_and_read(skill_code, watchdog_seconds=None):
     timer = None
     expired = None
     finished = None
+    completion_lock = None
     try:
         try:
             written = sys.stdout.write(send_bytes)
@@ -629,8 +629,10 @@ def _transmit_and_read(skill_code, watchdog_seconds=None):
         if watchdog_seconds is not None:
             expired = threading.Event()
             finished = threading.Event()
+            completion_lock = threading.Lock()
             timer = threading.Timer(
-                float(watchdog_seconds), watchdog_callback, args=(expired, finished)
+                float(watchdog_seconds), watchdog_callback,
+                args=(expired, finished, completion_lock)
             )
             timer.daemon = True
             timer.start()
@@ -643,16 +645,18 @@ def _transmit_and_read(skill_code, watchdog_seconds=None):
             return sys.stdin.read(1)
 
         response = read_response_frame(read_one)
-        if expired is not None and expired.is_set():
-            raise ExecutionUncertain(
-                "legacy watchdog fired; late response attribution is unsafe"
-            )
-        if finished is not None:
-            finished.set()
+        if completion_lock is not None:
+            with completion_lock:
+                finished.set()
+                if expired.is_set():
+                    raise ExecutionUncertain(
+                        "legacy watchdog fired; late response attribution is unsafe"
+                    )
         return response
     finally:
-        if finished is not None:
-            finished.set()
+        if completion_lock is not None:
+            with completion_lock:
+                finished.set()
         if timer is not None:
             timer.cancel()
         if tmp_il_path:

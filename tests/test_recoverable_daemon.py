@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import hmac
 import importlib.util
@@ -492,7 +493,7 @@ def test_legacy_watchdog_poison_blocks_recoverable_without_consuming_late_frame(
         buffer=types.SimpleNamespace(read=lambda n=1: next(chunks))
     )
     monkeypatch.setattr(module, "threading", types.SimpleNamespace(
-        Event=threading.Event, Timer=_Timer
+        Event=threading.Event, Timer=_Timer, Lock=threading.Lock
     ))
     monkeypatch.setattr(module.sys, "stdout", fake_stdout)
     monkeypatch.setattr(module.sys, "stdin", fake_stdin)
@@ -525,3 +526,138 @@ def test_python2_sources_are_ascii_and_optional_runtime_compiles() -> None:
         capture_output=True,
     )
     assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+
+
+def test_legacy_lane_stays_owned_until_watchdog_decision_finishes(monkeypatch, tmp_path):
+    """A timer paused before its decision must not signal the next request."""
+    module = _import_daemon(monkeypatch, tmp_path)
+    callback_entered = threading.Event()
+    allow_callback = threading.Event()
+    response_read = threading.Event()
+    call_completed = threading.Event()
+    finished_event = threading.Event()
+    timers = []
+    signals = []
+
+    class DelayedFinished:
+        def is_set(self):
+            observed = finished_event.is_set()
+            callback_entered.set()
+            assert allow_callback.wait(2)
+            return observed
+
+        def set(self):
+            finished_event.set()
+
+    events = iter((threading.Event(), DelayedFinished()))
+
+    class Timer:
+        daemon = True
+
+        def __init__(self, seconds, callback, args=()):
+            self.worker = threading.Thread(target=callback, args=args)
+            timers.append(self)
+
+        def start(self):
+            self.worker.start()
+            assert callback_entered.wait(2)
+
+        def cancel(self):
+            pass  # Timer.cancel(), too, cannot stop an already running callback.
+
+    monkeypatch.setattr(module, "threading", types.SimpleNamespace(
+        Event=lambda: next(events), Timer=Timer, Lock=threading.Lock,
+    ))
+    monkeypatch.setattr(module, "sys", types.SimpleNamespace(
+        stdout=types.SimpleNamespace(buffer=types.SimpleNamespace(
+            write=lambda data: len(data), flush=lambda: None,
+        )),
+    ))
+    monkeypatch.setattr(module.os, "kill", lambda *args: signals.append(args))
+
+    def read_frame(read_one):
+        response_read.set()
+        return b"\x023"
+
+    monkeypatch.setattr(module, "read_response_frame", read_frame)
+    assert module._RECOVERY.try_begin_legacy()[0]
+
+    def legacy():
+        poison = None
+        try:
+            module._transmit_and_read("1+2", 1)
+        except ExecutionUncertain as exc:
+            poison = str(exc)
+        finally:
+            module._RECOVERY.finish_legacy(poison)
+            call_completed.set()
+
+    caller = threading.Thread(target=legacy)
+    caller.start()
+    try:
+        assert response_read.wait(2)
+        assert not call_completed.wait(0.1), "lane released with an undecided watchdog"
+        assert module._RECOVERY.try_begin_legacy() == (False, "IPC lane is busy")
+    finally:
+        allow_callback.set()
+        caller.join(2)
+        for timer in timers:
+            timer.worker.join(2)
+    assert not caller.is_alive()
+    assert len(signals) == 1 and module._RECOVERY.poisoned
+
+
+@pytest.mark.parametrize("daemon_name", ["ramic_bridge_daemon_3.py", "ramic_bridge_daemon_27.py"])
+@pytest.mark.parametrize("read_fails", [False, True])
+def test_finished_legacy_call_ignores_already_started_timer(daemon_name, read_fails):
+    """Exercise both completion paths in each shipped watchdog implementation.
+
+    Extract the unchanged function bodies so Python 2-specific daemon startup
+    is not executed under Python 3; this does not replace a Python 2 runtime test.
+    """
+    timers = []
+    signals = []
+
+    class Timer:
+        daemon = True
+
+        def __init__(self, seconds, callback, args=()):
+            self.callback = callback
+            self.args = args
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    stream = types.SimpleNamespace(write=lambda data: len(data), flush=lambda: None)
+    stream.buffer = stream
+
+    def read_frame(read_one):
+        if read_fails:
+            raise ExecutionUncertain("pipe closed")
+        return b"\x023"
+
+    namespace = {
+        "threading": types.SimpleNamespace(Event=threading.Event, Lock=threading.Lock, Timer=Timer),
+        "sys": types.SimpleNamespace(stdout=stream),
+        "os": types.SimpleNamespace(kill=lambda *args: signals.append(args)),
+        "signal": types.SimpleNamespace(SIGINT=2), "virtuoso_pid": 1,
+        "_prepare_skill": lambda code: (b"request", None),
+        "read_response_frame": read_frame,
+        "RequestNotStarted": RequestNotStarted, "ExecutionUncertain": ExecutionUncertain,
+    }
+    tree = ast.parse((_resources() / daemon_name).read_text(encoding="ascii"))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("watchdog_callback", "_transmit_and_read")]
+    exec(compile(ast.Module(body=functions, type_ignores=[]), daemon_name, "exec"), namespace)
+    if read_fails:
+        with pytest.raises(ExecutionUncertain, match="pipe closed"):
+            namespace["_transmit_and_read"]("1+2", 1)
+    else:
+        assert namespace["_transmit_and_read"]("1+2", 1) == b"\x023"
+    # Simulate a callback that Timer.cancel() could not prevent from running.
+    timers[0].callback(*timers[0].args)
+    assert signals == []
