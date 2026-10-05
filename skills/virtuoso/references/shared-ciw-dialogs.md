@@ -1,5 +1,9 @@
 # Shared CIW Dialog Protection
 
+The APIs below require a compatible client and running daemon. Check their
+capabilities before use; an older checkout or a skill update alone does not
+provide this protection. Without it, use manual coordination for a shared CIW.
+
 Humans and Bridge can operate the same Virtuoso process. A popup in that
 process cannot reliably be attributed to either party, even when it appears
 immediately after a Bridge request. Never automatically press Enter, Cancel,

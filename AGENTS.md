@@ -1,469 +1,81 @@
-# AGENTS.md — AI Agent Guide for virtuoso-bridge-lite
+# Agent guide — virtuoso-bridge-lite
 
-Control Cadence Virtuoso via Python — remotely over SSH or locally on the same machine.
+Control Virtuoso through Python/SKILL and run Spectre independently.
 
-## Lite design boundary
+## Lite boundary
 
-Keep Spectre execution and PDK/CDF callbacks central, with lightweight wrappers
-for common schematic/symbol and GDS operations; use SKILL for the long tail.
-Advanced multi-server/account/process configuration is opt-in. Before adding
-configuration or workflow abstractions, read `docs/adr/0003-lite-default-optional-advanced-config.md`.
+Spectre execution and PDK/CDF callbacks are the core. Lightweight schematic,
+symbol and GDS operations cover common work; raw SKILL handles the long tail.
+Existing one-host configuration and APIs remain sufficient. Multi-server,
+multi-account and process configuration are opt-in, with no mandatory migration.
+Before adding configuration or workflow abstractions, read
+[the Lite decision](docs/adr/0003-lite-default-optional-advanced-config.md).
 
-## Agent skills
+## Working in this repository
 
-### Issue tracker
+- Use `uv` and a project virtual environment. Install with `uv pip install -e .`.
+- Canonical implementation: `src/virtuoso_bridge/`; runnable workflows:
+  `examples/`; standalone helpers: `tools/`.
+- Locate modules with `rg --files` before guessing paths. CLI entrypoint:
+  `virtuoso_bridge.cli:main`, registered as `virtuoso-bridge` in `pyproject.toml`.
+  `python -m virtuoso_bridge.cli` is not the console entrypoint.
+- Preserve unrelated working-tree changes. Prefer an existing clean worktree
+  for work that overlaps them.
+- Documentation edits and offline tests need no SSH, daemon startup or GUI
+  interaction. Connect only when the task actually needs live EDA operations.
+- Installed skills may be symlinks to another checkout. Resolve their paths
+  before editing; check the active client and daemon capabilities before using
+  version-specific APIs. Updating instructions does not upgrade running code.
 
-When reading or publishing issues and PRs, use GitHub through `gh`; read `docs/agents/issue-tracker.md`.
+## Operational boundaries
 
-### Triage labels
+Execute SKILL through `VirtuosoClient` or `virtuoso-bridge eval/load`.
+Use explicit schematic/layout `create()` or `modify()`; replacing an existing
+design requires authorization. Check/save and refresh applicable PDK callbacks
+before netlisting; raw property changes alone do not reproduce GUI behavior.
 
-When triaging issues, use the category and state mapping in `docs/agents/triage-labels.md`.
+Treat a shared CIW as user-owned. Inspect suspected dialogs out of band; let the
+user resolve unknown-origin dialogs. An uncertain request is not a failed
+request: preserve its handle/history and reconcile the original outcome before
+any retry. Read [shared-CIW protection](skills/virtuoso/references/shared-ciw-dialogs.md)
+before popup-prone operations or recovery; its guard is opt-in and version-gated.
+Keep authentication and daemon identity checks enabled on shared hosts.
 
-### Domain docs
+## Read only the relevant references
 
-Before domain design or code review, read the single-context glossary and relevant ADRs as directed by `docs/agents/domain.md`.
+- Live Virtuoso/SKILL, schematic, symbol, layout, GDS or Maestro:
+  [virtuoso skill](skills/virtuoso/SKILL.md).
+- Standalone netlist-driven simulation and PSF:
+  [spectre skill](skills/spectre/SKILL.md). No Virtuoso daemon is required.
+- Netlist cleaning: [netlist skill](skills/netlist/SKILL.md).
+- Parameter optimization: [optimizer skill](skills/optimizer/SKILL.md).
+- First connection, host/configuration changes or virtualenv rebuilding:
+  [connection guide](skills/virtuoso/references/connection.md).
+- SKILL functions, PDK parameters or version-dependent behavior:
+  [installed-doc verification](skills/virtuoso/references/local-docs.md).
+- Issues/PRs: use `gh`, then read [tracker guidance](docs/agents/issue-tracker.md).
+  For issue triage also read [label mapping](docs/agents/triage-labels.md).
+- Domain/interface design or review: [domain decisions](docs/agents/domain.md).
+- Explicit profile auditing or site environment selectors:
+  [profile audit](docs/profile-audit.md); these are not default setup steps.
+- Requested traffic maintenance: [traffic guide](docs/agents/traffic.md).
+- Windows skill links cloned as text: inspect `scripts/fix-symlinks.sh` before
+  running it for the affected checkout. General user setup is in [README](README.md).
 
-## Two modes
+## Verification
 
-| Mode | When | Setup |
-|---|---|---|
-| **Remote** | Virtuoso on a server, you work locally | Set `VB_REMOTE_HOST` for one host, or explicit `VB_*_HOST` roles, then run `virtuoso-bridge start` |
-| **Local** | Virtuoso on your own machine | Set `VB_REMOTE_HOST=localhost`, run `virtuoso-bridge start`, load the path it prints into CIW |
-
-## Prerequisites
-
-1. **SSH**: `ssh my-server` must work without a password prompt.
-2. **Virtuoso** (for SKILL execution): a running Virtuoso process on the remote (or local) machine.
-3. **Spectre** (for simulation only): `spectre` on PATH, or set `VB_CADENCE_CSHRC` to a cshrc that adds Cadence tools to PATH.
-
-> Virtuoso and Spectre are **independent** — you can run Spectre without the SKILL bridge, and vice versa.
-
-## Install (both modes)
-
-> **Use `uv` + virtual environment** — never install into the global Python.
-
-```bash
-uv venv .venv && source .venv/bin/activate   # Windows: source .venv/Scripts/activate
-uv pip install -e .
-```
-
-## Step-by-step setup (remote mode)
-
-**1. Generate config**
-
-```bash
-# Preferred — fill host/user/jump in one shot:
-virtuoso-bridge init designer1@compute.example.com -J designer1@bastion.example.com
-
-# Or — empty template (you edit `.env` manually in step 2):
-virtuoso-bridge init
-```
-
-Both forms create `~/.virtuoso-bridge/.env`. `-J/--jump` accepts `[user@]host`.
-`VB_REMOTE_PORT` / `VB_LOCAL_PORT` are auto-assigned by hashing the **remote**
-username (stable per remote user, so two users on the same host usually don't
-collide). The remote port is host-global — whoever binds it first owns it — so
-`virtuoso-bridge start` also probes the port over SSH and shifts to the next
-free one if another user's process already holds it (the choice is written
-back to `.env`).
-Re-running `init` on an existing `.env` is a no-op; pass `--force` to overwrite.
-
-**2. Edit `.env`** (only if step 1 did not already fill it in)
-
-> **Where to put `.env`:** `--env FILE` has the highest priority. Without it, the bridge walks from the current directory upward and uses the first `.env` that looks like a Virtuoso Bridge config (a `VB_*_HOST` role or `VB_LOCAL_PORT`), then falls back to `~/.virtuoso-bridge/.env`.
-
-```dotenv
-VB_REMOTE_HOST=my-server              # SSH host alias from ~/.ssh/config
-VB_REMOTE_USER=username               # SSH username on the remote
-VB_REMOTE_PORT=65081                  # port for the bridge daemon on remote
-VB_LOCAL_PORT=65082                   # local port forwarded via SSH tunnel
-
-# Split-host overrides (optional; VB_REMOTE_HOST remains the fallback)
-# VB_GUI_HOST=gui-host-a              # Virtuoso CIW and X11
-# VB_DEPLOY_HOST=gui-host-a           # receives generated files
-# VB_DAEMON_HOST=compute-host-b       # ipcBeginProcess daemon / tunnel target
-# VB_SPECTRE_HOST=compute-host-b      # standalone Spectre jobs
-# VB_REMOTE_SCRATCH_ROOT=/home/username/.virtuoso-bridge  # shared path
-
-# Optional — only needed if `spectre` is not already on PATH in the remote shell.
-# VB_CADENCE_CSHRC=/path/to/.cshrc   # cshrc that sets up Cadence tools on the remote
-```
-
-**3. Start the bridge**
+Run proportionate tests in the project environment:
 
 ```bash
-virtuoso-bridge start
+uv run --extra dev pytest
 ```
 
-**4. Load SKILL in Virtuoso CIW**
-
-`virtuoso-bridge start` deploys the SKILL bridge files to a per-remote-user,
-per-local-client temp dir on the remote host and prints the exact `load(...)`
-line you need to paste into the CIW. The client segment defaults to the local
-account running bridge (for example `90590` on Windows) and can be overridden
-with `VB_CLIENT_ID` or `VB_CLIENT_ID_<profile>`, so it is collision-free across
-users and across local machines sharing the same remote scratch root:
-
-```
-load("/tmp/virtuoso_bridge_<remote_user>/<client_id>/virtuoso_bridge/virtuoso_setup.il")
-```
-
-(Run `virtuoso-bridge status` again at any time to re-print this line.
-Add it to your remote `~/.cdsinit` to auto-load on every Virtuoso
-startup.)
-
-If the SSH host's `/tmp` is not visible inside CIW, set
-`VB_REMOTE_SCRATCH_ROOT` to a home or scratch directory shared by the GUI,
-deployment, and daemon hosts, then rerun `start`.
-
-For an opt-in first load through X11, select one explicit CIW. The bootstrap
-command accepts no arbitrary SKILL and refuses non-CIW windows:
-
-```bash
-virtuoso-bridge list-windows --top-level --json
-virtuoso-bridge bootstrap --window 0x3000012
-```
-
-Loading the setup file does not replace an already-running daemon in the same
-CIW; stop the old daemon with `RBStop()` or `RBStopAll()` before loading another
-profile or port.
-
-**5. Verify**
-
-```bash
-virtuoso-bridge status
-```
-
-**6. Connect from Python**
-
-```python
-from virtuoso_bridge import VirtuosoClient
-client = VirtuosoClient.from_env()
-client.execute_skill("1+2")  # VirtuosoResult(status=SUCCESS, output='3')
-```
-
-> **CIW output vs return value**: `execute_skill()` returns the result to Python but does **not** print in the CIW window. To also display in CIW, use `printf` explicitly:
-> `client.execute_skill(r'let((v) v=1+2 printf("1+2 = %d\n" v) v)')`.
-> See `examples/01_virtuoso/basic/00_ciw_output_vs_return.py`.
-
-### Jump host setup
-
-If you access Virtuoso through a bastion/jump host, set both hosts in `.env`:
-
-```dotenv
-VB_REMOTE_HOST=compute-host   # the machine running Virtuoso (NOT the jump host)
-VB_JUMP_HOST=jump-host        # the bastion you SSH through
-```
-
-Common mistake: setting `VB_REMOTE_HOST` to the jump host. `VB_REMOTE_HOST` must be the machine where Virtuoso is actually running.
-
-Some Cadence environments are genuinely split: the CIW runs on the jump/login
-host while `ipcBeginProcess()` launches the daemon on a compute host. Represent
-that topology explicitly instead of overloading `VB_REMOTE_HOST`:
-
-```dotenv
-VB_GUI_HOST=gui-host-a
-VB_DEPLOY_HOST=gui-host-a
-VB_DAEMON_HOST=compute-host-b
-VB_SPECTRE_HOST=compute-host-b
-VB_JUMP_HOST=gui-host-a
-VB_REMOTE_SCRATCH_ROOT=/home/user/.virtuoso-bridge
-```
-
-The bridge suppresses the jump for the GUI target itself. `status` compares the
-CIW-persisted daemon banner with the hostname reached by the tunnel endpoint and
-prints a `VB_DAEMON_HOST` correction when they differ.
-
-### Multi-profile setup
-
-Connect to multiple Virtuoso instances simultaneously with `-p`. Profile names are **case-sensitive** and appended as suffixes to env var names.
-
-```dotenv
-# Default (no profile)
-VB_REMOTE_HOST=server-a
-VB_REMOTE_USER=user1
-
-# Profile "worker1" — used with `-p worker1`
-VB_REMOTE_HOST_worker1=server-b
-VB_REMOTE_USER_worker1=user2
-VB_CADENCE_CSHRC_worker1=/path/to/.cshrc.worker1
-```
-
-```bash
-virtuoso-bridge start -p worker1
-virtuoso-bridge status -p worker1
-```
-
-```python
-from virtuoso_bridge.spectre import SpectreSimulator
-sim = SpectreSimulator.from_env(profile="worker1")
-```
-
-> Profile suffixes are case-sensitive. `-p worker1` reads `VB_REMOTE_HOST_worker1`, not `VB_REMOTE_HOST_WORKER1`.
-
-## First-time setup check
-
-When a user first opens this project, run these checks **before anything else**:
-
-### Remote check
-
-**Three-hop model** (common in EDA environments):
-```
-Your machine  ──SSH──►  Jump host (bastion)  ──SSH──►  Compute host (Virtuoso)
-              VB_JUMP_HOST                   VB_REMOTE_HOST
-```
-In the normal one-host model, `VB_REMOTE_HOST` is the daemon/tunnel target, not
-the jump host. If CIW and daemon are intentionally on different hosts, use
-`VB_GUI_HOST` and `VB_DAEMON_HOST` explicitly.
-
-1. **Check `.env`** — does it exist and define `VB_REMOTE_HOST`, or explicit GUI/daemon roles?
-   - If not: install in the project venv (`uv pip install -e .`) then ask the user for their SSH target. If they give `user@host` (plus optional jump), run `virtuoso-bridge init user@host [-J user@jump]` — it fills the one-host model in one shot. Otherwise run `virtuoso-bridge init` for an empty template and fill the role variables.
-   - Verify: `VB_GUI_HOST` owns CIW/X11, `VB_DAEMON_HOST` is the daemon tunnel endpoint, and `VB_JUMP_HOST` is only the route (if any). Unset roles fall back to `VB_REMOTE_HOST`.
-
-2. **Check SSH** — `ssh <VB_DAEMON_HOST-or-VB_REMOTE_HOST> echo ok` (and the GUI/deployment hosts when split)
-   - If this fails: tell the user to fix SSH first. The bridge assumes `ssh <host>` already works.
-
-3. **Check Virtuoso** — `ssh <VB_GUI_HOST-or-VB_REMOTE_HOST> "pgrep -f virtuoso"`
-   - If no process: tell the user to start Virtuoso first.
-
-4. **Start bridge** — `virtuoso-bridge start`
-   - If "degraded": paste the printed `load("...")` command in CIW, or select
-     an explicit CIW with `virtuoso-bridge list-windows --top-level --json`
-     and run `virtuoso-bridge bootstrap --window WINDOW_ID`.
-
-5. **Verify** — `virtuoso-bridge status`
-
-6. **Quick test** — `VirtuosoClient.from_env().execute_skill("1+2")`
-
-### Local mode
-
-Same flow as remote, but with `VB_REMOTE_HOST=localhost` (or `127.0.0.1`):
-`virtuoso-bridge start` notices it's local, skips the SSH tunnel, and
-deploys the SKILL bridge files under the local bridge state directory.  Paste the
-`load(...)` line it prints into your CIW once, then connect from Python:
-
-```python
-from virtuoso_bridge import VirtuosoClient
-bridge = VirtuosoClient.local(port=65432)
-bridge.execute_skill("1+2")
-```
-
-## Architecture
-
-Two decoupled layers:
-
-- **VirtuosoClient** — pure TCP SKILL client. No SSH. Works with any `localhost:port` endpoint.
-- **SSHClient** — resolves GUI/deployment/daemon/Spectre roles, deploys files, and manages the daemon tunnel. Optional.
-
-Both sides authenticate each other with an HMAC over a bridge token
-(`~/.virtuoso-bridge/bridge_token`, mode 0600) that is provisioned over SSH
-by `start` (or auto-created by the daemon / `VirtuosoClient.local()`), so a
-port held by another user's daemon can neither execute your SKILL nor
-masquerade as it. The token never crosses the TCP wire.
-
-```python
-# Remote: SSHClient creates the TCP path
-from virtuoso_bridge import SSHClient, VirtuosoClient
-tunnel = SSHClient.from_env()
-tunnel.warm()
-bridge = VirtuosoClient.from_tunnel(tunnel)
-
-# Local: no tunnel needed
-bridge = VirtuosoClient.local(port=65432)
-
-# Either way, same API:
-bridge.execute_skill("1+2")
-```
-
-## Two independent services
-
-The bridge manages two **independent** capabilities on the remote host:
-
-| Service | What it does | Requires |
-|---|---|---|
-| **Virtuoso daemon** | Execute SKILL expressions in the Virtuoso CIW | A running Virtuoso process + `load("...virtuoso_setup.il")` in CIW (auto-generated by `start`) |
-| **Spectre** | Run circuit simulations on the resolved Spectre host via SSH | `spectre` on PATH (or `VB_CADENCE_CSHRC` set) |
-
-They are fully independent — you can run Spectre without loading the SKILL bridge, and you can use the SKILL bridge without Spectre.
-
-`virtuoso-bridge status` reports both. Example output:
-```
-[tunnel]  running          ← SSH tunnel is up
-[daemon]  OK               ← Virtuoso CIW connected (or NO RESPONSE if not loaded)
-[spectre] OK               ← spectre found on remote (or NOT FOUND)
-```
-
-### How Spectre is located
-
-Each SSH command runs in a **fresh shell** with no prior state. Without a site
-selector, the bridge uses the existing PATH (or `VB_SPECTRE_BIN`). When
-`VB_CADENCE_CSHRC` is configured, it loads that environment before probing or
-running the tool, even when another installation is already on PATH.
-
-The default selector shell remains csh. A site with a POSIX sh script can
-explicitly set `VB_CADENCE_ENV_SHELL=sh`; normal one-host users need no extra
-configuration. See `docs/profile-audit.md` for optional profile audit and
-selector details. Environment initialization runs anew for each invocation.
-
-If `spectre` is already on PATH in the remote user's default shell (e.g., via `~/.bashrc` or `~/.cshrc`), `VB_CADENCE_CSHRC` is not needed.
-
-## Key conventions
-
-- SKILL execution goes through the bridge (`VirtuosoClient` in Python, or
-  `virtuoso-bridge eval/load` from the CLI). Never SSH and run SKILL manually.
-- Layout/schematic editing: explicit `client.layout.create()` / `modify()` and
-  `client.schematic.create()` / `modify()` context managers. The legacy
-  `edit()` methods are deprecated and default to safe append mode.
-- Spectre simulation: `SpectreSimulator.from_env()`. See "How Spectre is located" above.
-- Strict Spectre PSF access: use `virtuoso_bridge.spectre.psf` helpers
-  (`result_file`, `read_psf_ascii`, `scalar`, `vector`, `frequency_hz`) when a
-  missing file/key or the wrong result shape must fail fast.
-- `src/virtuoso_bridge/` is the canonical implementation. Use the installed
-  package for real work.
-- `tools/` contains standalone utilities (e.g. `skill_exec.py` — zero-dependency SKILL execution tool).
-
-## Common gotchas
-
-- **Shared CIW requests can create their own modal popup.** Preflight-only
-  inspection is insufficient. With an upgraded daemon, explicitly enable
-  `client.dialogs.enable_guard(protect_inflight=True)`. On an uncertain result,
-  preserve `metadata.request_handle` and query `client.requests.receipt(handle)`;
-  do not repeat the operation, close user dialogs or restart a pending daemon.
-  The opted-in mode has no process-level SIGINT watchdog. Legacy clients retain
-  theirs. See `skills/virtuoso/references/shared-ciw-dialogs.md` for limits.
-
-- **`csh()` returns `t`/`nil`**, not command output. Use `client.download_file()` (SSH/SCP) for remote file operations.
-- **`procedurep()` returns `nil` for compiled/built-in functions.** Don't use it to check if `mae*` functions exist.
-- **Remote files stay remote.** Functions like `maeCreateNetlistForCorner` write to the remote filesystem. Use `client.download_file()` to retrieve them.
-- **`system()` rc is unreliable** for tools that fork-and-write to a log (strmin, ihdl, sometimes spectre). A wrapper that polls for the expected artifact (cellview, file, log line) MUST also tail the tool's own log for terminal-failure markers on every poll iteration — otherwise a `strmin` that died in 2 seconds with `XSTRM-273: Translation failed` makes the wrapper sleep for its full timeout (10 min observed 2026-05-14 on `examples/01_virtuoso/digital_import/import_gds.py`). Dual-defense template: (1) before invoking the tool, stage any local file args to the tool's cwd via `client.upload_file()` so file-not-found can't happen, and (2) in the poll loop, `tail -n 200 <tool.log>` for the tool's "translation failed / OPEN_FAILED / ERROR" sentinel and fast-exit with that line.
-- **The daemon port is host-global; another user's Virtuoso can own it.** On a
-  shared server every bridge daemon binds `0.0.0.0` on a port in 65000-65499,
-  and the SSH tunnel lands on whichever process holds that port — SKILL sent
-  through it executes in *their* session. Defenses, in the order a connection
-  meets them: (1) `start` shifts the configured port off foreign listeners;
-  (2) the client runs a side-effect-free capability handshake (`op=hello`, no
-  SKILL payload) before its first command, so protocol/auth skew is detected
-  before anything can execute; (3) every request is signed with
-  `HMAC(token, canonical_frame(proto, nonce, timeout, skill))` — the whole
-  request, not just the nonce — and every response with
-  `HMAC(token, frame(nonce, marker, body))`; daemons also reject replayed
-  nonces server-side. The token lives only in an atomic 0600 file under a
-  0700 directory (`~/.virtuoso-bridge/bridge_token`, never in state.json),
-  provisioned over SSH by `start` / auto-created by the daemon, and never
-  crosses the wire — a squatter can neither execute your SKILL nor
-  impersonate your daemon; (4) `from_env`/`from_tunnel` additionally verify
-  the daemon's Unix user (`daemon_guard`) and refuse mismatches. If a check
-  fires while your own CIW is merely busy, retry when idle;
-  `AuthError: token mismatch` means the port is held by someone else — run
-  `RBStop()` on that session or `virtuoso-bridge restart` to move.
-  Intentional cross-user use still needs `VB_ALLOW_CROSS_USER_DAEMON=1` for
-  the identity guard. Insecure unauthenticated operation is fatal by default
-  and requires an explicit opt-in on both sides —
-  `VB_ALLOW_UNAUTHENTICATED_DAEMON=1` on the client,
-  `RB_ALLOW_UNAUTHENTICATED=1` on the daemon host. Rotating the token =
-  delete the file on the daemon host and re-run `start` / re-load in CIW.
-
-## How to configure PDK paths
-
-Export a netlist from Virtuoso (**Simulation > Netlist > Create**). The `.scs` file contains everything:
-
-```spectre
-include "/path/to/pdk/models/spectre/toplevel.scs" section=TOP_TT
-M0 (VOUT VIN VSS VSS) nch_ulvt_mac l=30n w=1u nf=1
-```
-
-## CLI reference
-
-```bash
-virtuoso-bridge init [user@host] [-J user@jump] [--force]   # write ~/.virtuoso-bridge/.env
-virtuoso-bridge start [--bind-venv]  # start SSH tunnel + deploy daemon
-virtuoso-bridge stop            # stop the SSH tunnel
-virtuoso-bridge restart         # force-restart and refresh deployed daemon setup
-virtuoso-bridge status          # check tunnel + Virtuoso daemon + Spectre
-virtuoso-bridge license         # check Spectre license availability
-virtuoso-bridge profile show    # print resolved profile, source, and venv binding path
-virtuoso-bridge profile bind PROFILE --venv  # pin active venv to PROFILE
-virtuoso-bridge profile clear --venv         # remove active venv's profile binding
-virtuoso-bridge load FILE.il    # run a .il file in Virtuoso (uploads in SSH mode)
-virtuoso-bridge eval 'EXPR'     # run inline SKILL expression
-virtuoso-bridge eval --stdin    # multi-line SKILL via stdin (auto-wrapped in progn)
-virtuoso-bridge windows         # list all open Virtuoso windows + focused session
-virtuoso-bridge snapshot        # brief summary of the focused Virtuoso window
-virtuoso-bridge snapshot -o ROOT  # full maestro disk dump (raw + filtered XMLs + per-point run files)
-virtuoso-bridge export-visio LIB CELL -o out.vsdx  # Windows + Visio/pywin32 schematic export
-                                                   #   uv pip install -e .[visio]  to pull pywin32
-                                                   #   --include-body-pins       to draw NMOS/PMOS bulk (B) nets
-                                                   #   --stencil PATH            override circuit.vss location
-virtuoso-bridge screenshot      # screenshot CIW to the user artifact directory
-virtuoso-bridge inspect-dialogs --pid PID --json  # read-only, process-scoped blocker check
-virtuoso-bridge dismiss-dialog --legacy-bulk  # explicit unsafe legacy bulk opt-in; not for shared CIWs
-virtuoso-bridge list-windows --json  # list Virtuoso-related X11 windows
-virtuoso-bridge list-windows --top-level --json  # one deduplicated entry per frame
-virtuoso-bridge bootstrap --window WINDOW_ID  # opt-in generated first load in one CIW
-virtuoso-bridge dismiss-window WINDOW_ID --display DISPLAY --action enter  # explicit authorized window/display
-virtuoso-bridge skill-find <query>  # search SKILL functions by name (fuzzy/prefix/suffix/exact/regex)
-virtuoso-bridge skill-info <fn>  # get detailed More Info docs for a SKILL function
-virtuoso-bridge doc-info  # Virtuoso version + doc-root structure (once per host before doc work)
-virtuoso-bridge doc-search <query>  # search installed Cadence docs (--doc-root for local,
-                                     #   --rebuild-index, --cache-dir, --json, -p PROFILE)
-```
-
-> **Doc-first rule:** SKILL code and PDK device parameters are not reliably in LLM
-> training data and differ across Virtuoso versions. Verify against the installed
-> docs (`doc-info` → `skill-find`/`skill-info` → `doc-search`) before writing SKILL
-> or using library cells — see `skills/virtuoso/references/local-docs.md`.
-
-## Build
-
-> **Recommended: use `uv` to manage the virtual environment.** `uv` refuses to install packages globally (unless `--system` is explicitly passed), preventing accidental pollution of the system Python.
-
-```bash
-uv venv .venv && source .venv/bin/activate   # Windows: source .venv/Scripts/activate
-uv pip install -e .
-```
-
-## Traffic stats: manual cadence — run before any 14-day gap
-
-`stats/{clones,views}.json` is a long-term record of repo traffic, populated
-by `scripts/track_traffic.py`. **GitHub's traffic API only retains 14 days**
-— any window not polled inside that 14-day rolling buffer is **permanently
-lost**.
-
-There is no auto-update: GitHub Actions' default `GITHUB_TOKEN` cannot access
-the `/traffic/clones` / `/traffic/views` endpoints (returns `403 Resource not
-accessible by integration` regardless of `permissions:`), so the polling has
-to happen locally:
-
-```bash
-GH_TOKEN=$(gh auth token) OWNER=Arcadia-1 REPO=virtuoso-bridge-lite \
-    python scripts/track_traffic.py
-git add stats/ && git commit -m "stats: traffic update $(date -u +%Y-%m-%d)" && git push
-```
-
-**`gh auth token` is the trick** — it returns a real user token (not the
-`GITHUB_TOKEN` Actions issues), which the traffic API does accept. No PAT
-to create.
-
-Cadence: aim for **≤10 days between runs** (gives a 4-day safety margin
-on the 14-day window). If a longer gap happened, the missing days are gone
-forever — don't try to fabricate them.
-
-## Skills & Reference Map
-
-When working on a task, check this table to find relevant skills and references.
-
-| Domain | Skill | Entry point | Key references |
-|---|---|---|---|
-| **Virtuoso / SKILL** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/layout-skill-api.md`, `references/schematic-skill-api.md`, `references/maestro-skill-api.md`, `references/troubleshooting.md` |
-| **SKILL Finder** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/skill-finder-python-api.md` |
-| **Layout** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/layout-python-api.md`, `references/layout-skill-api.md` |
-| **Library management** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/library-python-api.md` |
-| **Schematic** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/schematic-python-api.md`, `references/schematic-skill-api.md`, `references/schematic-recreation.md` |
-| **Maestro / ADE** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/maestro-python-api.md`, `references/maestro-skill-api.md`, `references/simulation-flow.md` |
-| **Spectre simulation** | `spectre` | `skills/spectre/SKILL.md` | `references/netlist_syntax.md`, `references/parallel.md` |
-| **Netlist cleanup / curation** | `netlist` | `skills/netlist/SKILL.md` | `references/cleaning.md`, `scripts/check_spectre_netlist.py` |
-| **Netlist export/import** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/netlist.md`, `references/batch-netlist-si.md` |
-| **Cadence documentation (doc-first protocol)** | `virtuoso` | `skills/virtuoso/SKILL.md` | `references/local-docs.md` (`doc-info` / `skill-find` / `skill-info` / `doc-search`) |
-| **Parameter optimization** | `optimizer` | `skills/optimizer/SKILL.md` | — |
-
-All reference paths are relative to the skill directory (e.g. `skills/virtuoso/references/layout-skill-api.md`).
+Check `pyproject.toml` and `.github/workflows/tests.yml` for the current test
+configuration and platform coverage. Shell/environment changes need real,
+bounded shell execution, not just command-string assertions; report skipped
+shell cases. CLI subprocess tests should exercise the registered entrypoint.
+Documentation-only changes need valid references and skill frontmatter checks.
+
+State separately what was tested offline and what was verified on real
+Cadence/PDK hardware. A green fixture suite does not establish GUI-equivalent
+electrical results.

@@ -24,13 +24,20 @@ with client.schematic.create(lib, cell) as sch:
 
 ## CDF Parameter Setting
 
-Use `set_instance_params` for PDK devices — handles `schHiReplace` + CDF callback:
+Read the actual device's CDF before setting parameters. Editable names and
+callback dependencies differ by PDK; `nf`/`fingers` mappings in an example are
+not a universal device contract. For supported PDK devices, use
+`set_instance_params`, which handles `schHiReplace` and the CDF callback:
 
 ```python
 from virtuoso_bridge.virtuoso.schematic.params import set_instance_params
 
 set_instance_params(client, "MP0", w="500n", l="30n", nf="4", m="2")
 ```
+
+When using raw SKILL, refresh the applicable changed-parameter callbacks in
+their documented order, then read back derived values and check/save before
+netlisting. A stored property update alone can leave derived parameters stale.
 
 For analogLib devices, direct CDF access works:
 

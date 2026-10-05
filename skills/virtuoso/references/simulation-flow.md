@@ -1,6 +1,16 @@
 # Standard Simulation Flow (GUI Mode)
 
-Complete flow from opening Maestro to reading results. Follow this order exactly.
+Use this for an explicitly authorized GUI-based simulation. Standalone netlist
+simulation uses the Spectre skill and needs no Maestro session.
+
+## Lifecycle scope
+
+The first example assumes a dedicated CIW whose Maestro lifecycle belongs to
+this workflow. `open_gui_session` may clean up other sessions/windows; it is not
+a harmless way to attach to a human's existing session. In a shared CIW, use the
+existing-session path below with a compatible guarded client. For all modes,
+an uncertain run/save is not permission to close the session, restart the daemon
+or submit a second run. Read [Shared CIW Dialog Protection](shared-ciw-dialogs.md).
 
 > **Why GUI mode?** Background sessions (`open_session` / `maeOpenSetup`) can
 > read/write config but cannot run simulations reliably: completion callbacks
@@ -10,24 +20,15 @@ Complete flow from opening Maestro to reading results. Follow this order exactly
 ## The standard flow
 
 ```python
-from virtuoso_bridge import VirtuosoClient, decode_skill_output
+from virtuoso_bridge import VirtuosoClient
 
 client = VirtuosoClient.from_env()
 LIB, CELL = "myLib", "myTestbench"
 
-# ── Step 0: Purge stale cellviews from memory ────────────────────
-# Prevents ASSEMBLER-8127 caused by internal edit locks from
-# previously closed sessions.
-client.maestro.purge_maestro_cellviews()
-
-# ── Step 1: Open maestro (handles cleanup automatically) ─────────
-# open_gui_session cleans background sessions, closes other cells'
-# windows, and opens in editable mode.
+# ── Step 1: Open the workflow's dedicated Maestro session ────────
+# This helper can clean other sessions/windows. Use only in the authorized
+# dedicated CIW; shared CIWs use an explicitly resolved existing session.
 session = client.maestro.open_gui_session(LIB, CELL)
-
-# Or manually (if you need more control):
-# client.execute_skill('foreach(s maeGetSessions() errset(maeCloseSession(?session s ?forceClose t)))')
-# client.execute_skill(f'deOpenCellView("{LIB}" "{CELL}" "maestro" "maestro" nil "a")')
 
 # ── Step 2: (Optional) Modify variables, outputs, etc. ──────────
 # client.execute_skill(f'maeSetVar("CL" "1p" ?session "{session}")')
@@ -55,21 +56,42 @@ for point in results.get("points", []):
 
 ## When you already have an open GUI session
 
-If Maestro is already open and editable (for example, the user opened it
-manually), skip the purge/open stages and resolve that window's session before
-saving and running:
+Reuse the already configured client and resolve the exact session from the
+selected library/cell/window. Do not choose `car(maeGetSessions())`: the first
+session may belong to another design. Saving or changing the user's setup still
+requires authorization.
+
+With a compatible upgraded daemon, an explicitly authorized shared-CIW run can
+use the opt-in guard before any SKILL operation:
 
 ```python
-# Find the existing session
-session = decode_skill_output(
-    client.execute_skill('car(maeGetSessions())').output)
+def run_existing_session(client, lib, cell, session):
+    # session is the caller's verified library/cell/window binding.
+    client.dialogs.enable_guard(protect_inflight=True)
+    state = client.maestro.get_session_state(session)
+    if (
+        state.context != "gui"
+        or state.access != "editing"
+        or state.unsaved is None
+        or state.session != session
+        or (state.lib, state.cell, state.view) != (lib, cell, "maestro")
+    ):
+        raise RuntimeError("Resolve exact session state before saving/running")
 
-# Save, run, wait, read — same path as above
-client.maestro.save_setup(LIB, CELL, session=session)
-history, status = client.maestro.run_and_wait(session=session, timeout=600)
-history = history.strip('"')
-results = client.maestro.read_results(session, lib=LIB, cell=CELL, history=history)
+    client.maestro.save_setup(lib, cell, session=session)
+    history, status = client.maestro.run_and_wait(session=session, timeout=600)
+    history = history.strip('"')
+    results = client.maestro.read_results(
+        session, lib=lib, cell=cell, history=history,
+    )
+    return history, status, results
 ```
+
+Guard failures and unknown request outcomes stop the workflow. Preserve the
+request handle and acknowledged history/marker for reconciliation, not a retry.
+Do not downgrade to unguarded legacy execution when these capabilities are
+unavailable. Constructing a new ordinary client or reloading a daemon is not
+popup recovery.
 
 ## How `run_and_wait` works
 
@@ -113,6 +135,9 @@ wrong session or triggering an ASSEMBLER-8127/modal path.
 
 ## Closing Maestro sessions
 
+The examples below apply only to a verified, workflow-owned session with no
+pending or uncertain request/run. A force-close can cancel a simulation.
+
 ### GUI-opened sessions (`maeCloseSession` won't work)
 
 Sessions opened via the Virtuoso GUI (File → Open) **cannot be closed** with `maeCloseSession` — it returns ASSEMBLER-8051. You must close the GUI window:
@@ -137,35 +162,22 @@ These can be closed with `maeCloseSession`:
 client.execute_skill(f'maeCloseSession(?session "{session}" ?forceClose t)')
 ```
 
-### Clean up all sessions
+### Cleanup scope
 
-```python
-# Close GUI windows first (saves modified ones)
-client.execute_skill('''
-foreach(w hiGetWindowList()
-  let((s name)
-    s = car(errset(axlGetWindowSession(w)))
-    when(s
-      name = hiGetWindowName(w)
-      when(name && rexMatchp("\\*$" name)
-        maeSaveSetup(?session s))
-      hiCloseWindow(w))))
-''')
-
-# Then close any remaining background sessions
-client.execute_skill('''
-foreach(s maeGetSessions() maeCloseSession(?session s ?forceClose t))
-''')
-```
+Close only the session/window owned by the workflow, after its request and
+simulation outcomes are known. On a shared CIW leave the user's sessions open.
+Purging cellviews, deleting lock files or closing every session is a separate
+maintenance operation requiring evidence that no active run owns them and
+explicit authorization for the entire affected scope.
 
 ## Common pitfalls
 
 | Pitfall | Symptom | Fix |
 |---------|---------|-----|
-| Not purging before open | ASSEMBLER-8127 from stale internal lock | `client.maestro.purge_maestro_cellviews()` before `open_gui_session` |
+| Stale internal edit lock | ASSEMBLER-8127 | Verify the owning session/run; clean only proven stale state within the authorized scope |
 | Using `open_session` for simulation | `run_and_wait` hangs / returns immediately | Use `open_gui_session` (GUI mode), not `open_session` (background) |
 | Skipping `save_setup` | Simulation uses stale parameters | Always save before running |
-| `maeCloseResults` leaves Maestro read-only | Next `maeRunSimulation` fails | Use `open_gui_session` to re-establish editable mode |
+| `maeCloseResults` leaves Maestro read-only | Next `maeRunSimulation` fails | Inspect the exact session before an authorized access-mode change; do not clean other windows |
 | `maeCloseSession` on GUI-opened session | ASSEMBLER-8051: "opened from UI" | Use `close_gui_session` instead |
 | `window:N` in multi-line SKILL | `unbound variable - window` | Use `foreach(w hiGetWindowList() ...)` to find windows by `w~>windowNum` |
 

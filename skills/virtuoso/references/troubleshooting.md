@@ -10,7 +10,7 @@ When something fails unexpectedly, search this file for keywords (error message,
 Never use `csh()` or `sh()` to verify files or read command output. They only return success/failure. Use `download_file` (SSH/SCP) for all remote file operations.
 
 ### `procedurep()` returns `nil` for compiled functions
-Functions like `maeCreateNetlistForCorner` are compiled into .cxt — `procedurep()` returns nil even though they work. Test by calling with wrong args instead.
+Functions like `maeCreateNetlistForCorner` are compiled into .cxt — `procedurep()` returns nil even though they work. Check the installed documentation and a supported `fboundp` probe; deliberately calling with wrong arguments is not a safe availability test.
 
 ### `printf` inside `foreach` loses output to Python
 `execute_skill()` returns the **value** of the SKILL expression, not whatever `printf` wrote to the CIW. So a loop that prints per iteration leaves Python holding only the loop's return value (often the input list, which prints as opaque `dd:0x…` handles):
@@ -86,7 +86,7 @@ blocked the same CIW event loop that serves the bridge.
 virtuoso-bridge inspect-dialogs --pid PID --json
 virtuoso-bridge list-windows --top-level --json
 # Only with explicit authorization for this window and action:
-virtuoso-bridge dismiss-window WINDOW_ID --action escape
+virtuoso-bridge dismiss-window WINDOW_ID --display DISPLAY --action escape
 ```
 
 The first command inspects one process without altering any window. A modal
@@ -101,21 +101,11 @@ structured outcomes, and watchdog limitations.
 
 **Never call `maeMakeEditable()` unconditionally.** It can deadlock the bridge.
 
-**Recovery when stuck:** if the remote has no `python3` or `xdotool`, send Enter via Python 2.7 + ctypes directly on the Virtuoso display:
-```bash
-# Find the Virtuoso DISPLAY (check /proc/<pid>/environ)
-DISPLAY=<virtuoso_display> python2.7 -c "
-import ctypes, ctypes.util
-xlib = ctypes.cdll.LoadLibrary(ctypes.util.find_library('X11'))
-xtst = ctypes.cdll.LoadLibrary(ctypes.util.find_library('Xtst'))
-dpy = xlib.XOpenDisplay(None)
-kc = xlib.XKeysymToKeycode(dpy, 0xff0d)
-xtst.XTestFakeKeyEvent(dpy, kc, True, 0)
-xtst.XTestFakeKeyEvent(dpy, kc, False, 0)
-xlib.XFlush(dpy)
-xlib.XCloseDisplay(dpy)
-"
-```
+**Recovery when stuck:** inspect the explicitly selected Virtuoso PID through
+X11 and let the user resolve the dialog. A fallback that injects Enter into the
+current focus can affect a different user's window. If inspection is unavailable
+or indeterminate, stop GUI mutations and request manual resolution. See
+[Shared CIW Dialog Protection](shared-ciw-dialogs.md).
 
 **Prevention:** before calling `maeMakeEditable()`, check if another session already has the cellview open in edit mode.
 
@@ -184,6 +174,16 @@ Or skip SKILL string-matching entirely and filter on the Python side via `client
 
 ### si output location
 `si -batch -command nl` outputs to `<runDir>/netlist` (a single file). But if something goes wrong (e.g. GUI dialog blocked), `spectre.inp` may be nearly empty. Check file size after download.
+
+### Batch tool exits before an expected artifact appears
+
+Tools such as `strmin` and `ihdl` can fork and write failures only to their own
+logs, so `system()` success is not proof that translation succeeded. Stage local
+input files to the tool's working directory before invocation. On every bounded
+artifact poll, also inspect the tail of that invocation's log for terminal
+failure markers such as `Translation failed`, `XSTRM-273` or `OPEN_FAILED`.
+Stop with the diagnostic when the tool fails rather than waiting out the entire
+timeout. Use unique run directories to exclude stale artifacts.
 
 ---
 
