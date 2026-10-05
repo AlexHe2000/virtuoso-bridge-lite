@@ -56,7 +56,8 @@ universally interchangeable. Details:
 
 Before popup-prone operations or timeout recovery, read
 [shared-ciw-dialogs.md](references/shared-ciw-dialogs.md).
-It is the authority for dialog ownership, opt-in guards and request receipts.
+It is the authority for dialog ownership, opt-in guards, request receipts and
+explicitly reviewed informational close.
 
 Inspect through SSH/X11 when SKILL is blocked. Leave unknown-origin dialogs to
 the user; never automatically press Enter/Cancel or close the current form.
