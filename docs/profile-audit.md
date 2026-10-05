@@ -78,3 +78,37 @@ do not prove what an already-running CIW loaded. Matrix composition, forbidden
 combinations, and runtime process-version identity are not implemented by this
 increment. A future optional identity check needs trustworthy per-session
 evidence, not directory names, modification times, or client-side declarations.
+
+## Session launch evidence is not run-model provenance
+
+Some sites export release identifiers when launching Virtuoso. An explicitly
+selected, authenticated CIW can read those site-defined values through SKILL
+(`getShellEnvVar`) and check whether the expected library resolves (`ddGetObj`).
+This is an optional site-wrapper use of the existing SKILL interface, not a new
+default setup step or a live mode of `profile list`.
+
+Matching that record establishes only **launch-record agreement**, under the
+site's launcher policy. A library name resolving is an additional witness, not
+proof that its actual path/content matches the declared release. Site wrappers
+must define the mapping to process/revision/variant, verify relevant library
+bindings, and fail closed on missing or mismatched evidence. Environment and
+library-binding immutability is a site assumption, not a universal Virtuoso
+guarantee; refresh evidence if the workflow can change either at runtime.
+
+The **model baseline of a simulation** is a separate, per-run fact. The same
+CIW/release can netlist different model files, select different sections, or use
+updated content at the same path. A successful launch-record check cannot
+certify that two simulation results used identical models.
+
+When reproducibility requires it, the run-producing workflow should retain the
+actual submitted netlist/deck, selected model sections, relevant include files
+and their content hashes with the result. Hashing only a top-level model file
+does not cover its transitive dependencies. Use an immutable/staged model set,
+or identify before/after changes and mark uncertain evidence as unverified;
+an environment variable, path, mtime, or later hash alone is not proof of the
+content the simulator read. This evidence can contain proprietary information
+and should remain in the user's approved artifact storage.
+
+These optional checks belong in the site's thin wrapper/raw-SKILL workflow.
+No generic process/model identity flag, mandatory preflight, matrix composer,
+or automatic PDK-version gate is added to ordinary Lite use.
