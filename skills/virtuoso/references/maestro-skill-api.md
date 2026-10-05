@@ -14,7 +14,10 @@
 
 **Rule of thumb: use background for read/write config, use GUI for simulation.**
 
-Residual lock cleanup: first try `maeCloseSession` on any stale sessions (`maeGetSessions`). Only delete `.cdslck` manually if no active session exists (e.g. after Virtuoso crash).
+Residual lock cleanup is scoped maintenance: close only an owned, proven stale
+session. Delete a lock file only with explicit authorization after verifying
+that no live Virtuoso/session/run owns it; a confusing title or timeout is not
+proof that a lock is stale.
 
 ---
 
@@ -83,7 +86,7 @@ client.execute_skill('maeSetVar("VDD" "0.8,0.9,1.0")')
 
 ## Maestro mae* API (IC618 / IC231)
 
-All `mae*` functions operate on the **complete maestro cellview**, not just the visible window. If the maestro view is open in the GUI, `?session` can be omitted.
+All `mae*` functions operate on the **complete maestro cellview**, not just the visible window. Single-session examples may omit `?session`; shared/multi-session automation must explicitly bind the intended session.
 
 ### Session Management
 
@@ -388,42 +391,21 @@ maeCloseResults()
 
 ### Opening Maestro & Displaying History Results
 
-To open a maestro view and display a previous simulation history:
+For result inspection, prefer `client.maestro.read_results(..., history=history)`
+with the exact acknowledged history and verified library/cell/session. Inspecting
+results does not require closing every session or restoring a history into setup.
 
-```python
-lib, cell = "myLib", "myCell"
+For a requested GUI history restore, inspect the target window/session first.
+`maeRestoreHistory` changes the active setup; verify its installed signature and
+obtain authorization for that setup change and any subsequent save. A renamed
+history need not be `Interactive.N`, and lexical sorting is not a reliable way
+to select the latest run.
 
-# Step 1: Close all existing sessions (edit mode is exclusive)
-r = client.execute_skill('maeGetSessions()')
-for session in r.output.strip('()').replace('"', '').split():
-    if session and session != 'nil':
-        client.execute_skill(f'maeCloseSession(?session "{session}" ?forceClose t)')
-
-# Step 2: List available histories via simulation results directory
-#   Path: <simDir>/maestro/results/maestro/<historyName>/
-#   Use getDirFiles to list, filter out dot-prefixed entries
-r = client.execute_skill('asiGetResultsDir(asiGetCurrentSession())')
-rd = r.output.strip('"')
-base = re.match(r'(.*/maestro/results/maestro/)', rd).group(1)
-r = client.execute_skill(f'getDirFiles("{base}")')
-dirs = r.output.strip('()').replace('"', '').split()
-histories = sorted([d for d in dirs if not d.startswith('.')])
-latest = histories[-1]  # e.g. "Interactive.1"
-
-# Step 3: Open GUI + make editable + restore history + save
-client.execute_skill(f'deOpenCellView("{lib}" "{cell}" "maestro" "maestro" nil "r")')
-client.execute_skill('maeMakeEditable()')
-client.execute_skill(f'maeRestoreHistory("{latest}")')
-client.execute_skill(f'maeSaveSetup(?lib "{lib}" ?cell "{cell}" ?view "maestro")')
-```
-
-Key points:
-- **Edit mode is exclusive** — only one session can have a cellview in edit mode. Must close all existing sessions first via `maeCloseSession(?forceClose t)`.
-- `deOpenCellView` opens the GUI window (read mode initially).
-- `maeMakeEditable()` switches to edit mode — **call immediately after opening**, before any modifications. Otherwise closing the window triggers a "save changes?" dialog that deadlocks the SKILL channel (read-only can't save, dialog blocks everything).
-- `maeRestoreHistory("Interactive.N")` sets the history as active setup, making results visible in the GUI.
-- `maeSaveSetup` persists the state — **always save before closing**.
-- History names are **not always** `Interactive.N` — they can be renamed by the user.
+Edit mode is exclusive for a cellview. If another session owns it, coordinate
+with its owner rather than force-closing unrelated sessions or unconditionally
+calling `maeMakeEditable()`. Unknown access/unsaved state stops lifecycle
+mutations. See [simulation-flow.md](simulation-flow.md) for owned versus shared
+session workflows.
 
 ### Utility
 
@@ -444,7 +426,7 @@ maeMigrateADEXLToMaestro("myLib" "myCell" "adexl" ?maestroView "maestro_convert"
 - **GUI dialogs** can block the SKILL execution channel. Common culprits: "Specify history name", "No analyses enabled", "Change Mode Confirmation". Inspect the selected PID through SSH/X11; never automatically close the current form in a shared CIW. See [Shared CIW Dialog Protection](shared-ciw-dialogs.md).
 - **Schematic must be checked & saved** (`schCheck` + `dbSave`) before simulation, otherwise netlisting fails with dialog.
 - **Schematic should be open in GUI** for Maestro to reference it correctly.
-- **`maeOpenSetup` creates background edit locks** — always pair with `maeCloseSession(?forceClose t)`. Stale `.cdslck` files may need manual deletion.
+- **`maeOpenSetup` creates background edit locks** — close only the background session opened by this workflow, after its run/request outcome is known. Force-close and lock deletion are not automatic timeout recovery.
 
 ## Pnoise Jitter Event — Automation Limitation
 
@@ -459,16 +441,12 @@ client.execute_skill(f'maeSetAnalysis("{test}" "pnoise" ?enable t ?options `(...
 
 **Note:** `maeGetAnalysis` and `maeSetAnalysis` work without `hiSetCurrentWindow`. They operate on the current active maestro session directly. Both backtick syntax `` `(("key" "val")) `` and `list(list("key" "val"))` work for the `?options` argument.
 
-The `measTableData` field can be set in memory and persisted to sdb:
-```python
-# Set in memory
-client.execute_skill('asiSetAnalysisFieldVal(_pnAna "measTableData" \'("1;Edge Crossing;voltage;/X_DUT/LP;/X_DUT/LM;-;50m;1;rise;-;...")')
-# Open form + apply to persist
-client.execute_skill('asiDisplayAnalysis(asiGetCurrentSession() "pnoise")')
-client.execute_skill('hiFormApply(hiGetCurrentForm())')
-client.execute_skill('hiFormDone(hiGetCurrentForm())')
-client.execute_skill(f'maeSaveSetup(...)')
-```
+The `measTableData` field can be set in memory, but the observed workaround
+required Apply in the pnoise analysis form to persist it. This is a GUI-dependent
+experiment, not a shared-CIW recovery recipe. Have the user apply the explicitly
+identified form; generic `hiFormApply(hiGetCurrentForm())` /
+`hiFormDone(hiGetCurrentForm())` can operate on a different form. Check the
+installed Cadence version and read back persisted data before relying on it.
 
 ### What does NOT work
 
@@ -537,43 +515,45 @@ client.download_file('/tmp/ac_db.txt', Path('output/ac_db.txt'))
 
 ## Complete Maestro Workflow (Python)
 
+This example owns a dedicated CIW's lifecycle. For a shared/user-opened Maestro,
+use the exact-session guarded path in [simulation-flow.md](simulation-flow.md).
+
 ```python
 client = VirtuosoClient.from_env()
 
 # 1. Open Maestro in GUI mode (required for supported simulation flows)
 session = client.maestro.open_gui_session(lib, cell)
 
-try:
-    # 2. Create/configure the test with the high-level wrappers
-    client.maestro.create_test(
-        "AC", lib=lib, cell=cell, view="schematic", session=session)
-    client.maestro.set_analysis("AC", "tran", enable=False, session=session)
-    client.maestro.set_analysis(
-        "AC", "ac",
-        options='(("start" "1") ("stop" "10G") ("dec" "20"))',
-        session=session,
-    )
-    client.maestro.add_output(
-        "Vout", "AC", output_type="net", signal_name="/OUT", session=session)
-    client.maestro.set_var("c_val", "1p,100f", session=session)
-    client.maestro.save_setup(lib=lib, cell=cell, session=session)
+# 2. Create/configure the test with the high-level wrappers
+client.maestro.create_test(
+    "AC", lib=lib, cell=cell, view="schematic", session=session)
+client.maestro.set_analysis("AC", "tran", enable=False, session=session)
+client.maestro.set_analysis(
+    "AC", "ac",
+    options='(("start" "1") ("stop" "10G") ("dec" "20"))',
+    session=session,
+)
+client.maestro.add_output(
+    "Vout", "AC", output_type="net", signal_name="/OUT", session=session)
+client.maestro.set_var("c_val", "1p,100f", session=session)
+client.maestro.save_setup(lib=lib, cell=cell, session=session)
 
-    # 3. Recommended: callback + marker polling keeps the SKILL channel free.
-    # timeout is one end-to-end budget for request acceptance and completion.
-    history, status = client.maestro.run_and_wait(
-        session=session, timeout=300)
-    history = history.strip('"')
+# 3. Recommended: callback + marker polling keeps the SKILL channel free.
+# timeout is one end-to-end budget for request acceptance and completion.
+history, status = client.maestro.run_and_wait(
+    session=session, timeout=300)
+history = history.strip('"')
 
-    # 4. Consume exactly the run that just completed.
-    results = client.maestro.read_results(
-        session, lib=lib, cell=cell, history=history)
-finally:
-    client.maestro.close_gui_session(session, save=False)
+# 4. Consume exactly the run that just completed.
+results = client.maestro.read_results(
+    session, lib=lib, cell=cell, history=history)
+# Close only after verifying a completed run and an authorized lifecycle end:
+# client.maestro.close_gui_session(session, save=False)
 ```
 
 Legacy low-level workflows may call `maeRunSimulation()` followed by
 `maeWaitUntilDone('All)`, but that blocks the SKILL channel and prevents
-out-of-band inspection through the bridge. Keep it only for manual diagnostics;
+SKILL-based inspection. Out-of-band SSH/X11 inspection remains independent. Keep it only for manual diagnostics;
 new automation should use `run_and_wait()`.
 
 ## Examples

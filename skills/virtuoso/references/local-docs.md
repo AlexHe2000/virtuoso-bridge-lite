@@ -4,6 +4,14 @@ Verify SKILL code and library-cell usage against the **Cadence documentation
 installed on the target Virtuoso host** — before writing the code, not after it
 fails in CIW.
 
+Check the installed CLI's help before using version-specific commands. If
+`doc-info` is unavailable, identify the target installation from its installed
+metadata and use the available Finder/search tools or actual documentation
+files. Missing a convenience command does not establish a function's absence.
+
+`doc-info` identifies the documentation installation, not the version/process
+already loaded by a running CIW; verify that distinction when it matters.
+
 ## Why this is mandatory
 
 - SKILL function names, signatures, and PDK device parameters are **not
