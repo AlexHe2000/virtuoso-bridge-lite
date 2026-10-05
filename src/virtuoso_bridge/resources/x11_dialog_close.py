@@ -39,6 +39,8 @@ _MAX_IMAGE_BYTES = 4 * 1024 * 1024
 _MAX_TITLE_CHARS = 512
 _MAX_DISPLAY_CHARS = 256
 _MAX_TIMEOUT_SECONDS = 60.0
+_MAX_TREE_WINDOWS = 1024
+_MAX_ANCESTORS = 32
 _DISPLAY_RE = re.compile(r"^[A-Za-z0-9_./\[\]:-]+(?:\.[0-9]+)?$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -139,6 +141,25 @@ class _XEvent(ctypes.Union):
     _fields_ = [("client", _XClientMessageEvent), ("pad", ctypes.c_long * 24)]
 
 
+class _XErrorEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("resourceid", ctypes.c_ulong), ("serial", ctypes.c_ulong),
+                ("error_code", ctypes.c_ubyte), ("request_code", ctypes.c_ubyte),
+                ("minor_code", ctypes.c_ubyte)]
+
+
+_X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                   ctypes.POINTER(_XErrorEvent))
+
+
+def _intersects(left, right):
+    return left[0] < right[2] and right[0] < left[2] and left[1] < right[3] and right[1] < left[3]
+
+
+def _contains(outer, inner):
+    return outer[0] <= inner[0] and outer[1] <= inner[1] and outer[2] >= inner[2] and outer[3] >= inner[3]
+
+
 def _has_control(value):
     return any(ord(character) < 32 or ord(character) == 127 for character in value)
 
@@ -168,8 +189,8 @@ def _validate_command(value):
     if not isinstance(value, dict):
         raise _Refused("command must be a JSON object")
     operation = value.get("op")
-    if operation not in ("prepare", "close"):
-        raise _Refused("op must be prepare or close")
+    if operation not in ("prepare", "close", "state"):
+        raise _Refused("op must be prepare, close or state")
     if operation == "prepare":
         expected = set(("op", "pid", "display", "ciw_window", "window_id", "title", "timeout"))
     else:
@@ -185,7 +206,7 @@ def _validate_command(value):
     if timeout <= 0.0 or timeout > _MAX_TIMEOUT_SECONDS:
         raise _Refused("timeout is outside its accepted bounds")
     snapshot = None
-    if operation == "close":
+    if operation in ("close", "state"):
         snapshot = _validate_snapshot(value["snapshot"])
         target = snapshot["target"]
         dialog = snapshot["dialog"]
@@ -217,7 +238,7 @@ def _validate_command(value):
         "title": title,
         "timeout": timeout,
     }
-    if operation == "close":
+    if operation in ("close", "state"):
         command["snapshot"] = snapshot
     return command
 
@@ -400,6 +421,11 @@ class _NativeDialogConnection(object):
         self._display = None
         self._closed = False
         self._grabbed = False
+        self._errors = []
+        self._previous_error_handler = None
+        self._error_handler_installed = False
+        self._error_callback = _X_ERROR_HANDLER(self._handle_x_error)
+        self._shape = None
         self._declare_signatures()
         previous = {}
         missing = object()
@@ -422,6 +448,9 @@ class _NativeDialogConnection(object):
                     os.environ[key] = old_value
         if not self._display:
             raise _Refused("cannot open display %s" % display)
+        self._previous_error_handler = self._xlib.XSetErrorHandler(
+            ctypes.cast(self._error_callback, ctypes.c_void_p))
+        self._error_handler_installed = True
 
     def _declare_signatures(self):
         lib = self._xlib
@@ -451,6 +480,139 @@ class _NativeDialogConnection(object):
         lib.XSendEvent.restype = ctypes.c_int
         lib.XFree.argtypes = [ctypes.c_void_p]
         lib.XFree.restype = ctypes.c_int
+        lib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        lib.XSetErrorHandler.restype = ctypes.c_void_p
+        lib.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                  ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                                  ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint)]
+        lib.XQueryTree.restype = ctypes.c_int
+        lib.XTranslateCoordinates.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                                              ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                                              ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
+        lib.XTranslateCoordinates.restype = ctypes.c_int
+
+    def _handle_x_error(self, _display, event):
+        self._errors.append(int(event.contents.error_code))
+        return 0
+
+    def _attributes(self, window, allow_missing=False):
+        attributes = _inventory._XWindowAttributes()
+        self._errors = []
+        status = self._xlib.XGetWindowAttributes(self._display, int(window), ctypes.byref(attributes))
+        self._xlib.XSync(self._display, 0)
+        if allow_missing and self._errors == [3]:  # BadWindow, not a generic I/O failure.
+            return None
+        if not status or self._errors:
+            raise _Refused("cannot read exact native window attributes")
+        return attributes
+
+    def window_state(self, window_id):
+        attributes = self._attributes(int(window_id, 16), allow_missing=True)
+        return {"exists": attributes is not None,
+                "mapped": attributes is not None and attributes.map_state != 0}
+
+    def _tree(self, window):
+        root, parent, count = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        self._errors = []
+        status = self._xlib.XQueryTree(self._display, int(window), ctypes.byref(root),
+                                     ctypes.byref(parent), ctypes.byref(children), ctypes.byref(count))
+        try:
+            if not status or self._errors or count.value > _MAX_TREE_WINDOWS:
+                raise _Refused("cannot establish bounded native stacking order")
+            return int(root.value), int(parent.value), [int(children[i]) for i in range(count.value)]
+        finally:
+            if children:
+                self._xlib.XFree(ctypes.cast(children, ctypes.c_void_p))
+
+    def _rect(self, window, attributes, root, border=False):
+        x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        self._errors = []
+        status = self._xlib.XTranslateCoordinates(self._display, int(window), root, 0, 0,
+                                                ctypes.byref(x), ctypes.byref(y), ctypes.byref(child))
+        if not status or self._errors:
+            raise _Refused("cannot establish native screen coordinates")
+        pad = int(attributes.border_width) if border else 0
+        return (x.value - pad, y.value - pad,
+                x.value + int(attributes.width) + pad, y.value + int(attributes.height) + pad)
+
+    def _load_shape_library(self):
+        # find_library can launch ldconfig/compiler probes; never do this grabbed.
+        if self._grabbed and self._shape is None:
+            raise _Refused("SHAPE library must be loaded before the server grab")
+        if self._shape is None:
+            library = ctypes.util.find_library("Xext")
+            if not library:
+                raise _Refused("libXext is required to verify rectangular visibility")
+            self._shape = ctypes.cdll.LoadLibrary(library)
+            self._shape.XShapeQueryExtension.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+            self._shape.XShapeQueryExtension.restype = ctypes.c_int
+            self._shape.XShapeQueryExtents.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [
+                ctypes.POINTER(kind) for kind in (ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_uint, ctypes.c_uint, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint)]
+            self._shape.XShapeQueryExtents.restype = ctypes.c_int
+            event, error = ctypes.c_int(), ctypes.c_int()
+            if not self._shape.XShapeQueryExtension(self._display, ctypes.byref(event), ctypes.byref(error)):
+                self._shape = None
+                raise _Refused("SHAPE extension unavailable; visibility cannot be established")
+
+    def _require_unshaped(self, window):
+        if self._shape is None:
+            raise _Refused("SHAPE capability unavailable; visibility cannot be established")
+        values = [kind() for kind in (ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+                                     ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_uint, ctypes.c_uint)]
+        self._errors = []
+        status = self._shape.XShapeQueryExtents(self._display, window, *[ctypes.byref(v) for v in values])
+        if not status or self._errors or values[0].value or values[5].value:
+            raise _Refused("shaped or unverifiable window clipping is unsupported")
+
+    def _require_pixels_observable(self, window, attributes):
+        if not self._grabbed:
+            raise _Refused("visibility must be verified under the server grab")
+        root = int(attributes.root)
+        reviewed = self._rect(window, attributes, root)
+        current, visited, budget = window, set(), 0
+        while True:
+            if current in visited or len(visited) >= _MAX_ANCESTORS:
+                raise _Refused("native ancestor chain exceeds bound")
+            visited.add(current)
+            attrs = attributes if current == window else self._attributes(current)
+            if attrs.map_state != _IS_VIEWABLE or not _contains(self._rect(current, attrs, root), reviewed):
+                raise _Refused("reviewed pixels are clipped or off-screen")
+            self._require_unshaped(current)
+            if current == root:
+                break
+            tree_root, parent, _ = self._tree(current)
+            if tree_root != root or not parent:
+                raise _Refused("native ancestor identity changed")
+            parent_root, _, siblings = self._tree(parent)
+            if parent_root != root or current not in siblings:
+                raise _Refused("native stacking ancestry changed")
+            for sibling in siblings[siblings.index(current) + 1:]:
+                budget += 1
+                if budget > _MAX_TREE_WINDOWS:
+                    raise _Refused("native visibility scan exceeds bound")
+                other = self._attributes(sibling)
+                if (other.map_state == _IS_VIEWABLE and other.window_class == 1
+                        and _intersects(self._rect(sibling, other, root, border=True), reviewed)):
+                    raise _Refused("reviewed pixels are obscured by a higher window")
+            current = parent
+        # XGetImage also leaves differently-deep inferiors undefined.
+        pending = [window]
+        while pending:
+            _, _, children = self._tree(pending.pop())
+            for child in children:
+                budget += 1
+                if budget > _MAX_TREE_WINDOWS:
+                    raise _Refused("native visibility scan exceeds bound")
+                attrs = self._attributes(child)
+                if attrs.map_state != _IS_VIEWABLE or attrs.window_class != 1:
+                    continue
+                if attrs.depth != attributes.depth:
+                    raise _Refused("mixed-depth visible inferiors are unsupported")
+                pending.append(child)
 
     def _atom(self, name):
         return int(self._xlib.XInternAtom(self._display, name.encode("ascii"), 0))
@@ -563,14 +725,35 @@ class _NativeDialogConnection(object):
                 self._xlib.XFree(ctypes.cast(pointer, ctypes.c_void_p))
 
     def capture(self, window_id, make_preview=False):
+        self._load_shape_library()
+        owns_grab = not self._grabbed
+        timer = _grab_exit_timer(1.0) if owns_grab else None
+        if timer:
+            timer.arm()
+        try:
+            if owns_grab:
+                self.grab()
+            result = self._capture_locked(window_id, make_preview)
+        finally:
+            try:
+                if owns_grab:
+                    self.ungrab()
+            finally:
+                if timer:
+                    timer.cancel()
+        if make_preview:
+            image, raw = result.pop("_preview")
+            result["preview_png_b64"] = base64.b64encode(_preview_png(image, raw)).decode("ascii")
+        return result
+
+    def _capture_locked(self, window_id, make_preview):
         window = int(window_id, 16)
-        attributes = _inventory._XWindowAttributes()
-        if not self._xlib.XGetWindowAttributes(self._display, window, ctypes.byref(attributes)):
-            raise _Refused("cannot read native window attributes")
+        attributes = self._attributes(window)
         if attributes.map_state != _IS_VIEWABLE or attributes.width <= 0 or attributes.height <= 0:
             raise _Refused("native window is not viewable")
         if int(attributes.width) * int(attributes.height) * 4 > _MAX_IMAGE_BYTES:
             raise _Refused("native window capture exceeds 4 MiB bound")
+        self._require_pixels_observable(window, attributes)
         image_pointer = self._xlib.XGetImage(
             self._display, window, 0, 0, attributes.width, attributes.height,
             ctypes.c_ulong(-1).value, _ZPIXMAP,
@@ -607,7 +790,11 @@ class _NativeDialogConnection(object):
             }
             result = {"native": native, "content_sha256": hashlib.sha256(raw).hexdigest()}
             if make_preview:
-                result["preview_png_b64"] = base64.b64encode(_preview_png(image, raw)).decode("ascii")
+                info = _XImage()
+                for field in ("width", "height", "bits_per_pixel", "byte_order", "bytes_per_line",
+                              "red_mask", "green_mask", "blue_mask"):
+                    setattr(info, field, getattr(image, field))
+                result["_preview"] = (info, raw)
             return result
         finally:
             self._xlib.XDestroyImage(image_pointer)
@@ -625,6 +812,7 @@ class _NativeDialogConnection(object):
             self._grabbed = False
 
     def send_delete(self, window_id):
+        self._errors = []
         event = _XEvent()
         event.client.type = _CLIENT_MESSAGE
         event.client.display = self._display
@@ -638,7 +826,7 @@ class _NativeDialogConnection(object):
             ctypes.byref(event),
         )
         self._xlib.XSync(self._display, 0)
-        if not status:
+        if not status or self._errors:
             raise _PossibleTransmission("XSendEvent did not confirm queuing")
 
     def close(self):
@@ -649,6 +837,9 @@ class _NativeDialogConnection(object):
         finally:
             if self._display:
                 self._xlib.XCloseDisplay(self._display)
+            if self._error_handler_installed:
+                self._xlib.XSetErrorHandler(self._previous_error_handler)
+                self._error_handler_installed = False
             self._closed = True
 
 
@@ -760,11 +951,25 @@ def handle_command(value):
         command = _validate_command(value)
         if command["op"] == "prepare":
             return _prepare(command)
+        if command["op"] == "state":
+            return _state(command)
         return _close(command)
     except _PossibleTransmission as error:
         return {"status": "unknown", "action_sent": None, "diagnostic": str(error)}
     except Exception as error:
         return {"status": "not_started", "action_sent": False, "diagnostic": str(error)}
+
+
+def _state(command):
+    if _read_process_start_ticks(command["pid"]) != command["snapshot"]["process_start_ticks"]:
+        raise _Refused("target process instance changed")
+    connection = _open_native_connection(command["pid"], command["display"])
+    try:
+        state = connection.window_state(command["window_id"])
+    finally:
+        connection.close()
+    return dict(state, status="window_state", target=command["snapshot"]["target"],
+                window_id=command["window_id"])
 
 
 def _read_command(stream):
@@ -786,7 +991,7 @@ def main():
         result = {"status": "not_started", "action_sent": False, "diagnostic": str(error)}
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
     sys.stdout.write(encoded + "\n")
-    return 0 if result.get("status") in ("prepared", "requested") else 2
+    return 0 if result.get("status") in ("prepared", "requested", "window_state") else 2
 
 
 if __name__ == "__main__":

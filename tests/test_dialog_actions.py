@@ -1,7 +1,6 @@
 """Client authorization tests; all X11 and identity operations are simulated."""
 
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +24,12 @@ def setup(monkeypatch):
         "target": TARGET.model_dump(), "dialog": {"title": "Reviewed information", "window_id": "0x20"},
         "content_sha256": HASH, "process_start": "100",
     }}
+    responses = {
+        "prepare": prepared,
+        "close": {"status": "requested", "action_sent": True},
+        "state": {"status": "window_state", "target": TARGET.model_dump(), "window_id": "0x20",
+                  "exists": False, "mapped": False},
+    }
     # Initialize the action facade without issuing a request.
     from virtuoso_bridge.virtuoso.dialog_actions import DialogActionOps
     actions = DialogActionOps(client.dialogs)
@@ -32,11 +37,10 @@ def setup(monkeypatch):
 
     def exchange(payload, deadline):
         calls.append(payload)
-        return deepcopy(prepared) if payload["op"] == "prepare" else {"status": "requested", "action_sent": True}
+        return deepcopy(responses[payload["op"]])
 
     monkeypatch.setattr(actions, "_exchange", exchange)
-    monkeypatch.setattr(client.dialogs, "inspect", lambda **k: DialogInspection(status="clear", target=TARGET))
-    return client, actions, calls, caps, prepared
+    return client, actions, calls, caps, responses
 
 
 def ticket(client):
@@ -52,13 +56,15 @@ def test_default_never_authorizes_action(monkeypatch):
 
 
 def test_approved_unchanged_snapshot_closes_once(monkeypatch):
-    client, _, calls, _, _ = setup(monkeypatch)
+    client, _, calls, _, responses = setup(monkeypatch)
     preview = ticket(client)
     result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
     assert result.status == "closed" and result.action_sent is True
-    assert [c["op"] for c in calls] == ["prepare", "close"]
+    assert result.inspection["status"] == "window_state"
+    assert [c["op"] for c in calls] == ["prepare", "close", "state"]
+    assert calls[2] == {"op": "state", "snapshot": responses["prepare"]["snapshot"]}
     again = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
-    assert again.status == "not_started" and len(calls) == 2
+    assert again.status == "not_started" and len(calls) == 3
 
 
 def test_unapproved_content_consumes_ticket_without_execution(monkeypatch):
@@ -110,23 +116,78 @@ def test_backend_refusal_is_not_started(monkeypatch):
     assert result.status == "not_started" and result.action_sent is False
 
 
-def test_requested_is_not_claimed_closed_when_inspection_uncertain(monkeypatch):
-    client, _, _, _, _ = setup(monkeypatch)
+def test_clear_general_inspection_does_not_hide_mapped_original_window(monkeypatch):
+    client, _, calls, _, responses = setup(monkeypatch)
     preview = ticket(client)
-    monkeypatch.setattr(client.dialogs, "inspect", lambda **k: DialogInspection(status="indeterminate", target=TARGET))
-    assert client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH).status == "requested"
+    responses["state"]["exists"] = True
+    responses["state"]["mapped"] = True
+    inspections = []
+
+    def inspect(**kwargs):
+        inspections.append(kwargs)
+        return DialogInspection(status="clear", target=TARGET)
+
+    monkeypatch.setattr(client.dialogs, "inspect", inspect)
+    result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
+    assert result.status == "requested" and result.action_sent is True
+    assert not inspections
+    assert [call["op"] for call in calls] == ["prepare", "close", "state"]
 
 
-def test_post_send_inspection_failure_preserves_delivery_without_retry(monkeypatch):
-    client, _, calls, _, _ = setup(monkeypatch)
+def test_post_send_state_failure_preserves_delivery_without_retry(monkeypatch):
+    client, actions, calls, _, responses = setup(monkeypatch)
     preview = ticket(client)
-    def failed(**kwargs):
-        raise TimeoutError("inspection unavailable")
-    monkeypatch.setattr(client.dialogs, "inspect", failed)
+
+    def failed(payload, deadline):
+        calls.append(payload)
+        if payload["op"] == "state":
+            raise TimeoutError("window state unavailable")
+        return deepcopy(responses[payload["op"]])
+
+    monkeypatch.setattr(actions, "_exchange", failed)
     result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
     assert result.status == "requested" and result.action_sent is True
     assert client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH).status == "not_started"
-    assert len(calls) == 2
+    assert [call["op"] for call in calls] == ["prepare", "close", "state"]
+
+
+def test_existing_but_unmapped_exact_window_is_closed(monkeypatch):
+    client, _, _, _, responses = setup(monkeypatch)
+    preview = ticket(client)
+    responses["state"]["exists"] = True
+    responses["state"]["mapped"] = False
+    result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
+    assert result.status == "closed" and result.action_sent is True
+
+
+@pytest.mark.parametrize("state_update", [
+    {"status": "not_started", "diagnostic": "process start changed"},
+    {"status": "unexpected"},
+    {"target": {"pid": 99, "display": ":7", "ciw_window": "0x10"}},
+    {"window_id": "0x21"},
+    {"exists": False, "mapped": True},
+    {"exists": 0, "mapped": False},
+    {"exists": True, "mapped": 0},
+])
+def test_unverified_window_state_remains_requested(monkeypatch, state_update):
+    client, _, calls, _, responses = setup(monkeypatch)
+    preview = ticket(client)
+    responses["state"].update(state_update)
+    result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
+    assert result.status == "requested" and result.action_sent is True
+    assert [call["op"] for call in calls] == ["prepare", "close", "state"]
+    assert client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH).status == "not_started"
+
+
+@pytest.mark.parametrize("malformed", [None, [], "not a state report"])
+def test_non_object_window_state_remains_requested(monkeypatch, malformed):
+    client, _, calls, _, responses = setup(monkeypatch)
+    preview = ticket(client)
+    responses["state"] = malformed
+    result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
+    assert result.status == "requested" and result.action_sent is True
+    assert result.inspection is None
+    assert [call["op"] for call in calls] == ["prepare", "close", "state"]
 
 
 def test_authenticated_legacy_daemon_uses_native_process_binding(monkeypatch):
@@ -135,7 +196,7 @@ def test_authenticated_legacy_daemon_uses_native_process_binding(monkeypatch):
     preview = ticket(client)
     result = client.dialogs.close(preview, authorized=True, expected_content_sha256=HASH)
     assert result.status == "closed"
-    assert [call["op"] for call in calls] == ["prepare", "close"]
+    assert [call["op"] for call in calls] == ["prepare", "close", "state"]
 
 
 def test_ticket_tampering_refuses(monkeypatch):
@@ -171,8 +232,8 @@ def test_invalid_exact_title_rejected(monkeypatch, value):
 
 
 def test_wrong_prepared_target_refused(monkeypatch):
-    client, _, calls, _, prepared = setup(monkeypatch)
-    prepared["snapshot"]["target"]["pid"] = 99
+    client, _, calls, _, responses = setup(monkeypatch)
+    responses["prepare"]["snapshot"]["target"]["pid"] = 99
     with pytest.raises(ValueError, match="target"):
         ticket(client)
     assert len(calls) == 1

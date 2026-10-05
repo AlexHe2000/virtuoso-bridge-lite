@@ -3,6 +3,7 @@ import importlib.util
 import io
 import pathlib
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -376,3 +377,100 @@ def test_backend_contains_no_keyboard_focus_or_force_close_primitives():
     for forbidden in ("XTest", "XSetInputFocus", "XDestroyWindow", "XKillClient", "XWarpPointer", "XKeyEvent"):
         assert forbidden not in source
     assert source.count("XSendEvent(") == 1
+
+
+@pytest.mark.parametrize("left,right,overlap", [
+    ((0, 0, 10, 10), (10, 0, 20, 10), False),
+    ((0, 0, 10, 10), (9, 9, 20, 20), True),
+    ((0, 0, 10, 10), (0, 10, 10, 20), False),
+])
+def test_visibility_rectangles_do_not_treat_touching_edges_as_occlusion(left, right, overlap):
+    assert MODULE._intersects(left, right) is overlap
+    assert MODULE._contains(left, left)
+    assert not MODULE._contains(left, (-1, 0, 10, 10))
+
+
+@pytest.mark.parametrize("errors,status,missing", [([3], 0, True), ([10], 0, False),
+                                                        ([3, 10], 0, False), ([], 0, False)])
+def test_only_exact_badwindow_proves_absence(errors, status, missing):
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    connection._display = None
+
+    def attributes(*args):
+        connection._errors.extend(errors)
+        return status
+
+    connection._xlib = SimpleNamespace(XGetWindowAttributes=attributes, XSync=lambda *a: None)
+    if missing:
+        assert connection._attributes(42, allow_missing=True) is None
+    else:
+        with pytest.raises(MODULE._Refused):
+            connection._attributes(42, allow_missing=True)
+
+
+def test_preview_encoding_runs_after_owned_grab_is_released(monkeypatch):
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    connection._grabbed = False
+    connection._load_shape_library = lambda: None
+    events = []
+    connection.grab = lambda: events.append("grab")
+    connection.ungrab = lambda: events.append("ungrab")
+    connection._capture_locked = lambda *a: {"_preview": (object(), b"pixels")}
+    monkeypatch.setattr(MODULE, "_grab_exit_timer", lambda *a: SimpleNamespace(
+        arm=lambda: events.append("arm"), cancel=lambda: events.append("cancel")))
+
+    def preview(*args):
+        assert events == ["arm", "grab", "ungrab", "cancel"]
+        return b"PNG"
+
+    monkeypatch.setattr(MODULE, "_preview_png", preview)
+    assert connection.capture(WINDOW, make_preview=True) == {"preview_png_b64": "UE5H"}
+
+
+def test_capture_refusal_releases_owned_grab(monkeypatch):
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    connection._grabbed = False
+    connection._load_shape_library = lambda: None
+    events = []
+    connection.grab = lambda: events.append("grab")
+    connection.ungrab = lambda: events.append("ungrab")
+
+    def refuse(*args):
+        raise MODULE._Refused("obscured")
+
+    connection._capture_locked = refuse
+    monkeypatch.setattr(MODULE, "_grab_exit_timer", lambda *a: SimpleNamespace(
+        arm=lambda: events.append("arm"), cancel=lambda: events.append("cancel")))
+    with pytest.raises(MODULE._Refused, match="obscured"):
+        connection.capture(WINDOW)
+    assert events == ["arm", "grab", "ungrab", "cancel"]
+
+
+def test_missing_shape_library_cannot_approve_pixels(monkeypatch):
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    connection._shape = None
+    connection._grabbed = False
+    monkeypatch.setattr(MODULE.ctypes.util, "find_library", lambda *a: None)
+    with pytest.raises(MODULE._Refused, match="libXext"):
+        connection._load_shape_library()
+
+
+def test_shape_library_lookup_cannot_spawn_probes_while_grabbed(monkeypatch):
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    connection._shape = None
+    connection._grabbed = True
+    monkeypatch.setattr(MODULE.ctypes.util, "find_library", lambda *a: pytest.fail("probe while grabbed"))
+    with pytest.raises(MODULE._Refused, match="before the server grab"):
+        connection._load_shape_library()
+
+
+def test_state_rejects_process_reuse_before_x11(monkeypatch):
+    snapshot = prepared(monkeypatch)
+    monkeypatch.setattr(MODULE, "_read_process_start_ticks", lambda *a: 778)
+
+    def unexpected_connection(*args):
+        pytest.fail("State query must not open reused process display")
+
+    monkeypatch.setattr(MODULE, "_open_native_connection", unexpected_connection)
+    result = MODULE.handle_command({"op": "state", "snapshot": snapshot, "timeout": 5.0})
+    assert result["status"] == "not_started" and "instance changed" in result["diagnostic"]

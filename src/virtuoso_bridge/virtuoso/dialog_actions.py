@@ -30,7 +30,10 @@ class DialogCloseResult(BaseModel):
     status: Literal["not_started", "requested", "closed", "unknown"]
     action_sent: bool | None
     diagnostics: list[str] = Field(default_factory=list)
-    inspection: dict[str, Any] | None = None
+    inspection: dict[str, Any] | None = Field(
+        default=None,
+        description="Exact native state report for the ticketed window, not a general dialog inspection",
+    )
 
 
 class DialogActionOps:
@@ -141,18 +144,33 @@ class DialogActionOps:
         if payload.get("status") != "requested" or payload.get("action_sent") is not True:
             return DialogCloseResult(status="unknown", action_sent=None,
                                      diagnostics=[str(payload), "Do not repeat the action"])
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            try:
-                report = self._dialogs.inspect(timeout=remaining)
-            except Exception as exc:
-                return DialogCloseResult(status="requested", action_sent=True,
-                                         diagnostics=[str(exc), "Closure not confirmed. Do not resend."])
-            if report.status == "clear":
-                return DialogCloseResult(status="closed", action_sent=True,
-                                         inspection=report.model_dump(mode="json"))
+        if deadline <= time.monotonic():
             return DialogCloseResult(status="requested", action_sent=True,
-                                     inspection=report.model_dump(mode="json"),
-                                     diagnostics=["Request delivered; closure not confirmed. Do not resend."])
-        return DialogCloseResult(status="requested", action_sent=True,
-                                 diagnostics=["Wait budget exhausted; closure not verified"])
+                                     diagnostics=["Wait budget exhausted; closure not verified"])
+        try:
+            state = self._exchange({"op": "state", "snapshot": saved[2]}, deadline)
+        except Exception as exc:
+            return DialogCloseResult(status="requested", action_sent=True,
+                                     diagnostics=[str(exc), "Closure not confirmed. Do not resend."])
+
+        if not isinstance(state, dict):
+            return DialogCloseResult(
+                status="requested", action_sent=True,
+                diagnostics=["Malformed window state; closure not confirmed. Do not resend."],
+            )
+        expected_target = ticket.target.model_dump(mode="json")
+        valid_identity = (
+            state.get("status") == "window_state"
+            and state.get("target") == expected_target
+            and state.get("window_id") == ticket.window_id
+        )
+        exists = state.get("exists")
+        mapped = state.get("mapped")
+        valid_flags = type(exists) is bool and type(mapped) is bool and (exists or not mapped)
+        if valid_identity and valid_flags and mapped is False:
+            return DialogCloseResult(status="closed", action_sent=True, inspection=state)
+        return DialogCloseResult(
+            status="requested", action_sent=True,
+            inspection=state,
+            diagnostics=["Request delivered; exact window closure not confirmed. Do not resend."],
+        )

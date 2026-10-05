@@ -134,13 +134,32 @@ There is no Enter/escape/global keyboard input, focus stealing, window destructi
 process kill, or fallback when a window does not support the protocol. A changed,
 unmapped, ambiguous or unrecognized target is refused. No SKILL is used.
 
-A short X-server grab protects the final native comparison and message submission;
-no subprocess runs while grabbed. A helper-local hard deadline prevents a hung
+Being mapped/viewable is not sufficient for a reliable image. Each capture
+checks the complete target rectangle against root/ancestor clipping and higher
+siblings in native stacking order, including their borders. Obscured/off-screen
+pixels, shaped target/ancestor windows, mixed-depth visible inferiors, absent
+libXext/SHAPE support, or a visibility scan exceeding its bounds are refused.
+The helper does not raise, focus, or uncover a window to obtain approval.
+This is intentionally conservative, including shaped window-manager frames.
+XGetImage can return undefined obscured or differently-deep inferior pixels;
+see the [Xlib image specification](https://www.x.org/releases/current/doc/libX11/libX11/libX11.html#XGetImage).
+
+A short X-server grab protects each visibility check and capture, and the final
+native comparison and message submission. Visibility is rechecked under the final
+grab; preview PNG encoding happens after the capture grab is released. No
+subprocess runs while grabbed. A helper-local hard deadline prevents a hung
 native call from holding the grab indefinitely. This briefly pauses the display;
 it is not a desktop reservation or protection against every client-side race.
 
 Results distinguish `not_started` (`action_sent=false`), `requested`, `closed`,
-and `unknown`. A requested message is NOT proof that the window closed. A closed
+and `unknown`. A requested message is NOT proof that the window closed. A separate
+native query checks the ticket's exact display, process instance and window ID.
+Only confirmed destruction (BadWindow) or unmapping yields `closed`; a mapped
+window, even with an unmapped ancestor, or an unavailable/malformed query stays
+`requested` without resending. A general inspection reporting `clear` is not
+used as closure evidence. The result's optional `inspection` field contains this
+exact-window state report (`status=window_state`, `exists`, `mapped`, target/XID),
+not a general dialog inventory. A closed
 window is NOT proof that a design/save/run operation succeeded. Query the original
 request receipt separately when using the recoverable-request feature. Unknown
 transport outcomes never trigger automatic repeat; inspect and reconcile instead.
