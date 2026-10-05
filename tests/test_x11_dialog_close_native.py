@@ -28,6 +28,31 @@ XVFB = next((os.path.join(path, "Xvfb") for path in os.environ.get("PATH", "").s
              and os.access(os.path.join(path, "Xvfb"), os.X_OK)), None)
 
 
+class VisualInfo(ctypes.Structure):
+    _fields_ = [("visual", ctypes.c_void_p), ("visualid", ctypes.c_ulong),
+                ("screen", ctypes.c_int), ("depth", ctypes.c_int),
+                ("visual_class", ctypes.c_int), ("red_mask", ctypes.c_ulong),
+                ("green_mask", ctypes.c_ulong), ("blue_mask", ctypes.c_ulong),
+                ("colormap_size", ctypes.c_int), ("bits_per_rgb", ctypes.c_int)]
+
+
+class SetWindowAttributes(ctypes.Structure):
+    _fields_ = [("background_pixmap", ctypes.c_ulong), ("background_pixel", ctypes.c_ulong),
+                ("border_pixmap", ctypes.c_ulong), ("border_pixel", ctypes.c_ulong),
+                ("bit_gravity", ctypes.c_int), ("win_gravity", ctypes.c_int),
+                ("backing_store", ctypes.c_int), ("backing_planes", ctypes.c_ulong),
+                ("backing_pixel", ctypes.c_ulong), ("save_under", ctypes.c_int),
+                ("event_mask", ctypes.c_long), ("do_not_propagate_mask", ctypes.c_long),
+                ("override_redirect", ctypes.c_int), ("colormap", ctypes.c_ulong),
+                ("cursor", ctypes.c_ulong)]
+
+
+class Color(ctypes.Structure):
+    _fields_ = [("pixel", ctypes.c_ulong), ("red", ctypes.c_ushort),
+                ("green", ctypes.c_ushort), ("blue", ctypes.c_ushort),
+                ("flags", ctypes.c_char), ("pad", ctypes.c_char)]
+
+
 class Display(object):
     def __init__(self):
         self.process = None
@@ -134,6 +159,54 @@ class Canvas(object):
         self.lib.XSetWindowBackground(self.d, self.window, 0xFF0000)
         self.lib.XClearWindow(self.d, self.window)
         self.sync()
+
+    def direct_color(self, parent, x=0, y=0, width=160, height=60):
+        self.lib.XMatchVisualInfo.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                             ctypes.c_int, ctypes.POINTER(VisualInfo)]
+        self.lib.XCreateColormap.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                            ctypes.c_void_p, ctypes.c_int]
+        self.lib.XCreateColormap.restype = ctypes.c_ulong
+        self.lib.XCreateWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+            ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_int,
+            ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(SetWindowAttributes)]
+        self.lib.XCreateWindow.restype = ctypes.c_ulong
+        self.lib.XQueryColor.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(Color)]
+        self.lib.XStoreColor.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(Color)]
+        visual = VisualInfo()
+        if not self.lib.XMatchVisualInfo(self.d, 0, 24, 5, ctypes.byref(visual)):
+            raise RuntimeError("Dedicated Xvfb must expose 24-bit DirectColor")
+        colormap = self.lib.XCreateColormap(self.d, parent, visual.visual, 1)  # AllocAll
+        attributes = SetWindowAttributes()
+        attributes.colormap = colormap
+        attributes.background_pixel = visual.red_mask | visual.green_mask | visual.blue_mask
+        window = self.lib.XCreateWindow(self.d, parent, x, y, width, height, 0, 24,
+            1, visual.visual, (1 << 1) | (1 << 3) | (1 << 13), ctypes.byref(attributes))
+        self.lib.XMapWindow(self.d, window)
+        self.sync()
+        return window, colormap, attributes.background_pixel
+
+    def color(self, colormap, pixel, replacement=None):
+        color = Color()
+        color.pixel = pixel
+        if replacement is not None:
+            color.red, color.green, color.blue = replacement
+            color.flags = b"\x07"
+            self.lib.XStoreColor(self.d, colormap, ctypes.byref(color))
+            self.sync()
+        self.lib.XQueryColor(self.d, colormap, ctypes.byref(color))
+        return color.red, color.green, color.blue
+
+    def raw_pixels(self, window):
+        attrs = self.connection._attributes(window)
+        image = self.lib.XGetImage(self.d, window, 0, 0, attrs.width, attrs.height,
+                                  ctypes.c_ulong(-1).value, MODULE._ZPIXMAP)
+        if not image:
+            raise RuntimeError("Dedicated Xvfb image query failed")
+        try:
+            return ctypes.string_at(image.contents.data,
+                                    image.contents.bytes_per_line * image.contents.height)
+        finally:
+            self.lib.XDestroyImage(image)
 
     def deletes(self):
         count = 0
@@ -267,6 +340,44 @@ class NativeCloseTests(unittest.TestCase):
     def test_shaped_ancestor_cannot_approve_undefined_pixels(self):
         self.shape(self.canvas.frame)
         self.assertIn("shaped", self.refused(self.command))
+
+    def test_directcolor_palette_changes_cannot_approve_unchanged_pixel_indices(self):
+        window, colormap, pixel = self.canvas.direct_color(self.canvas.frame, 15, 25)
+        self.canvas.window = window
+        self.dialog["window_id"] = self.command["window_id"] = "0x%x" % window
+        self.canvas.property("_NET_WM_PID", 6, 32, (ctypes.c_ulong * 1)(os.getpid()), 1)
+        title = ctypes.create_string_buffer(b"Native reviewed information")
+        self.canvas.property("_NET_WM_NAME", self.canvas.connection._atom("UTF8_STRING"),
+                             8, title, len(title.value))
+        protocols = (ctypes.c_ulong * 1)(self.canvas.connection._atom("WM_DELETE_WINDOW"))
+        self.canvas.lib.XSetWMProtocols(self.canvas.d, window, protocols, 1)
+        self.canvas.lib.XSetTransientForHint(self.canvas.d, window, self.canvas.frame)
+        self.canvas.sync()
+        pixels = self.canvas.raw_pixels(window)
+        before = self.canvas.color(colormap, pixel)
+        after = self.canvas.color(colormap, pixel, tuple(65535 - channel for channel in before))
+        self.assertNotEqual(before, after)
+        self.assertEqual(pixels, self.canvas.raw_pixels(window))
+        self.assertIn("TrueColor", self.refused(self.command))
+
+    def test_same_depth_directcolor_inferior_cannot_approve_pixels(self):
+        self.canvas.direct_color(self.canvas.window, 10, 10, 40, 20)
+        self.assertIn("visual", self.refused(self.command))
+
+    def test_directcolor_inferior_at_final_grab_is_rechecked(self):
+        snapshot = self.prepared()
+        def open_connection(*args):
+            connection = MODULE._NativeDialogConnection(self.display.name, {})
+            grab, calls = connection.grab, [0]
+            def raced_grab():
+                calls[0] += 1
+                if calls[0] == 2:
+                    self.canvas.direct_color(self.canvas.window, 10, 10, 40, 20)
+                grab()
+            connection.grab = raced_grab
+            return connection
+        MODULE._open_native_connection = open_connection
+        self.assertIn("visual", self.refused({"op": "close", "snapshot": snapshot, "timeout": 5}))
 
     def test_uncovered_target_receives_one_message_but_remains_mapped(self):
         snapshot = self.prepared()

@@ -228,6 +228,10 @@ checks the complete target rectangle against root/ancestor clipping and higher
 siblings in native stacking order, including their borders. Obscured/off-screen
 pixels, shaped target/ancestor windows, mixed-depth visible inferiors, absent
 libXext/SHAPE support, or a visibility scan exceeding its bounds are refused.
+The target must use a TrueColor visual; visible InputOutput inferiors must share
+that exact visual. Visual identity and RGB masks are bound into the snapshot.
+Mutable colormaps can change displayed colors without changing pixel indices,
+so DirectColor and other unsupported visuals are refused rather than guessed.
 The helper does not raise, focus, or uncover a window to obtain approval.
 This is intentionally conservative, including shaped window-manager frames.
 XGetImage can return undefined obscured or differently-deep inferior pixels;

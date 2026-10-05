@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import importlib.util
 import io
 import pathlib
@@ -59,6 +60,8 @@ def native(content="a" * 64, pid=PID, window=WINDOW, title=TITLE, protocols=None
             "transient_for": CIW,
             "client_leader": CIW,
             "client_machine": "localhost",
+            "visual": {"visual_id": 42, "visual_class": 4, "red_mask": 0xFF0000,
+                       "green_mask": 0xFF00, "blue_mask": 0xFF},
             "geometry": {"width": 300, "height": 120, "depth": 24, "bits_per_pixel": 32, "bytes_per_line": 1200},
         },
         "content_sha256": content,
@@ -474,3 +477,30 @@ def test_state_rejects_process_reuse_before_x11(monkeypatch):
     monkeypatch.setattr(MODULE, "_open_native_connection", unexpected_connection)
     result = MODULE.handle_command({"op": "state", "snapshot": snapshot, "timeout": 5.0})
     assert result["status"] == "not_started" and "instance changed" in result["diagnostic"]
+
+
+@pytest.mark.parametrize("visual_class", [0, 1, 2, 3, 5])
+def test_mutable_or_unsupported_visuals_cannot_approve_pixels(visual_class):
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    visual = MODULE._XVisual()
+    visual.visual_class = visual_class
+    attrs = SimpleNamespace(visual=ctypes.cast(ctypes.pointer(visual), ctypes.c_void_p))
+    with pytest.raises(MODULE._Refused, match="TrueColor"):
+        connection._truecolor_visual(attrs)
+
+
+def test_missing_native_visual_cannot_approve_pixels():
+    connection = object.__new__(MODULE._NativeDialogConnection)
+    with pytest.raises(MODULE._Refused, match="unavailable"):
+        connection._truecolor_visual(SimpleNamespace(visual=None))
+
+
+def test_changed_visual_refuses_close_even_if_pixel_indices_match(monkeypatch):
+    snapshot = prepared(monkeypatch)
+    changed = native()
+    changed["native"]["visual"]["visual_id"] = 43
+    fake = FakeConnection([changed])
+    install(monkeypatch, fake)
+    result = MODULE.handle_command(command("close", snapshot))
+    assert result["status"] == "not_started"
+    assert fake.send_calls == 0

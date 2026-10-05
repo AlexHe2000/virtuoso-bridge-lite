@@ -53,6 +53,7 @@ _NO_EVENT_MASK = 0
 _XA_ATOM = 4
 _XA_CARDINAL = 6
 _XA_WINDOW = 33
+_TRUE_COLOR = 4
 
 
 class _Refused(Exception):
@@ -92,6 +93,13 @@ def _grab_exit_timer(seconds):
 
 class _XClassHint(ctypes.Structure):
     _fields_ = [("res_name", ctypes.c_void_p), ("res_class", ctypes.c_void_p)]
+
+
+class _XVisual(ctypes.Structure):
+    _fields_ = [("ext_data", ctypes.c_void_p), ("visual_id", ctypes.c_ulong),
+                ("visual_class", ctypes.c_int), ("red_mask", ctypes.c_ulong),
+                ("green_mask", ctypes.c_ulong), ("blue_mask", ctypes.c_ulong),
+                ("bits_per_rgb", ctypes.c_int), ("map_entries", ctypes.c_int)]
 
 
 class _XImage(ctypes.Structure):
@@ -262,7 +270,7 @@ def _validate_snapshot(snapshot):
     native = snapshot["native"]
     native_keys = set((
         "window_id", "mapped", "title", "pid", "wm_class", "wm_protocols",
-        "wm_state", "transient_for", "client_leader", "client_machine", "geometry",
+        "wm_state", "transient_for", "client_leader", "client_machine", "geometry", "visual",
     ))
     if not isinstance(native, dict) or set(native) != native_keys:
         raise _Refused("snapshot native metadata is invalid")
@@ -296,6 +304,15 @@ def _validate_snapshot(snapshot):
         number = geometry[name]
         if isinstance(number, bool) or not isinstance(number, _INTEGER_TYPES) or number <= 0:
             raise _Refused("snapshot native geometry is invalid")
+    visual = native["visual"]
+    if (not isinstance(visual, dict)
+            or set(visual) != set(("visual_id", "visual_class", "red_mask", "green_mask", "blue_mask"))
+            or visual.get("visual_class") != _TRUE_COLOR):
+        raise _Refused("snapshot native TrueColor visual is invalid")
+    for name in ("visual_id", "visual_class", "red_mask", "green_mask", "blue_mask"):
+        number = visual[name]
+        if isinstance(number, bool) or not isinstance(number, _INTEGER_TYPES) or number <= 0:
+            raise _Refused("snapshot native TrueColor visual is invalid")
     digest = snapshot["content_sha256"]
     if not isinstance(digest, _TEXT_TYPES) or not _SHA256_RE.match(digest):
         raise _Refused("snapshot content_sha256 is invalid")
@@ -571,6 +588,7 @@ class _NativeDialogConnection(object):
     def _require_pixels_observable(self, window, attributes):
         if not self._grabbed:
             raise _Refused("visibility must be verified under the server grab")
+        visual = self._truecolor_visual(attributes)
         root = int(attributes.root)
         reviewed = self._rect(window, attributes, root)
         current, visited, budget = window, set(), 0
@@ -612,7 +630,20 @@ class _NativeDialogConnection(object):
                     continue
                 if attrs.depth != attributes.depth:
                     raise _Refused("mixed-depth visible inferiors are unsupported")
+                if self._truecolor_visual(attrs) != visual:
+                    raise _Refused("visible inferiors must share the target TrueColor visual")
                 pending.append(child)
+        return visual
+
+    def _truecolor_visual(self, attributes):
+        if not attributes.visual:
+            raise _Refused("native visual is unavailable")
+        visual = ctypes.cast(attributes.visual, ctypes.POINTER(_XVisual)).contents
+        if visual.visual_class != _TRUE_COLOR:
+            raise _Refused("only TrueColor visuals have supported fixed RGB interpretation")
+        return {"visual_id": int(visual.visual_id), "visual_class": int(visual.visual_class),
+                "red_mask": int(visual.red_mask), "green_mask": int(visual.green_mask),
+                "blue_mask": int(visual.blue_mask)}
 
     def _atom(self, name):
         return int(self._xlib.XInternAtom(self._display, name.encode("ascii"), 0))
@@ -753,7 +784,7 @@ class _NativeDialogConnection(object):
             raise _Refused("native window is not viewable")
         if int(attributes.width) * int(attributes.height) * 4 > _MAX_IMAGE_BYTES:
             raise _Refused("native window capture exceeds 4 MiB bound")
-        self._require_pixels_observable(window, attributes)
+        visual = self._require_pixels_observable(window, attributes)
         image_pointer = self._xlib.XGetImage(
             self._display, window, 0, 0, attributes.width, attributes.height,
             ctypes.c_ulong(-1).value, _ZPIXMAP,
@@ -782,6 +813,7 @@ class _NativeDialogConnection(object):
                 "transient_for": self._window_property(window, "WM_TRANSIENT_FOR"),
                 "client_leader": self._window_property(window, "WM_CLIENT_LEADER"),
                 "client_machine": self._text_property(window, "WM_CLIENT_MACHINE"),
+                "visual": visual,
                 "geometry": {
                     "width": int(image.width), "height": int(image.height),
                     "depth": int(image.depth), "bits_per_pixel": int(image.bits_per_pixel),
