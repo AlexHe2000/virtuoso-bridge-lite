@@ -500,6 +500,53 @@ history, status = client.maestro.run_and_wait(session=session, timeout=600)
 # ... SKILL channel is free, do other work ...
 ```
 
+### Durable asynchronous jobs
+
+Use `MaestroJobManager` when a run must outlive the submitting Python process.
+It registers a Cadence completion callback, sends `maeRunSimulation` exactly
+once, and stores a local manifest keyed by `run_id`. Later `status()` and
+`log()` calls read small files from the Virtuoso GUI host; they do not send
+SKILL or require the original `VirtuosoClient` object.
+
+```python
+from pathlib import Path
+from virtuoso_bridge import VirtuosoClient
+from virtuoso_bridge.virtuoso.maestro import MaestroJobManager
+
+root = Path("results/maestro-jobs")
+client = VirtuosoClient.from_env(profile="lab")
+jobs = MaestroJobManager.from_client(client, local_root=root, profile="lab")
+job = jobs.submit(session=session, run_id="long-tran-001")
+client.close()
+
+# A later Python process can reattach without contacting the CIW.
+with MaestroJobManager.from_env(local_root=root, profile="lab") as jobs:
+    job = jobs.load("long-tran-001")
+    status = jobs.status(job)
+    print(status.state, status.history)
+```
+
+For a locally running Virtuoso process, create the submit manager with
+`from_client()` as usual and later use `MaestroJobManager.local()` to observe
+the saved handle.
+
+Submission requires an exact Maestro GUI session in Editing mode and enables
+the shared-CIW dialog guard with recoverable in-flight requests. If start
+acknowledgement is lost, `MaestroJobSubmissionError.state` is `unknown` and the
+exception retains the generated `run_id`; the start request is never repeated.
+Query that run id before deciding whether a new simulation is safe. Managers
+also reject a profile that differs from the connected client so a handle cannot
+silently point at the wrong GUI host.
+
+`status().state` is one of `running`, `completed`, `failed`, `missing`, or
+`unknown`. These are observations rather than a monotonic state machine:
+`unknown` or `missing` can later become `completed` when the callback marker is
+visible. A `completed` status only means the Cadence callback ran; it does not
+prove simulator success, output specs, or design acceptance.
+
+The lifecycle log contains only submitted/completed events. Read Maestro
+history and simulator output separately for result validation.
+
 ## Write — Export
 
 | Python | SKILL | Description |
