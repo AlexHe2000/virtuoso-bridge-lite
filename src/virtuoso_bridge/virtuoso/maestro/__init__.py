@@ -21,6 +21,7 @@ from virtuoso_bridge.virtuoso.maestro.history import (
 )
 from virtuoso_bridge.virtuoso.maestro.jobs import (
     MaestroJob,
+    MaestroJobEndpoint,
     MaestroJobManager,
     MaestroJobStatus,
     MaestroJobSubmissionError,
@@ -123,6 +124,7 @@ __all__ = [
     "unlock_history",
     # persistent asynchronous jobs
     "MaestroJob",
+    "MaestroJobEndpoint",
     "MaestroJobManager",
     "MaestroJobStatus",
     "MaestroJobSubmissionError",

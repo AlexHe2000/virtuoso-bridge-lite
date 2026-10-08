@@ -12,9 +12,11 @@ import math
 import os
 import re
 import shlex
+import socket
 import time
 import uuid
 from dataclasses import dataclass
+from getpass import getuser
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,12 +35,25 @@ from virtuoso_bridge.transport.ssh import (
     ssh_proxy_url_from_os,
 )
 from virtuoso_bridge.virtuoso.ops import escape_skill_string
+from virtuoso_bridge.virtuoso.requests import RequestHandle
 
 
 MaestroJobTransport = Literal["ssh", "local"]
 
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 _PID = re.compile(r"^[1-9][0-9]*$")
+_MANIFEST_SCHEMA = 2
+
+
+@dataclass(frozen=True)
+class MaestroJobEndpoint:
+    """Filesystem and account identity that owns a durable job namespace."""
+
+    transport: MaestroJobTransport
+    configured_gui_host: str
+    observed_gui_host: str
+    account: str
+    namespace: str
 
 
 @dataclass(frozen=True)
@@ -53,7 +68,11 @@ class MaestroJob:
     session: str
     history: str | None
     virtuoso_pid: int | None
+    process_start: str | None
     target: dict[str, Any]
+    endpoint: MaestroJobEndpoint
+    request_handle: RequestHandle | None
+    request_evidence: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -67,6 +86,7 @@ class MaestroJobStatus:
     work_dir: str
     transport: MaestroJobTransport
     virtuoso_pid: int | None
+    process_start: str | None
     completion: str | None
     diagnostics: tuple[str, ...]
 
@@ -74,10 +94,20 @@ class MaestroJobStatus:
 class MaestroJobSubmissionError(RuntimeError):
     """Submission stopped with a durable run id and classified outcome."""
 
-    def __init__(self, message: str, *, run_id: str, state: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: str,
+        state: str,
+        request_handle: RequestHandle | None = None,
+        request_evidence: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.run_id = run_id
         self.state = state
+        self.request_handle = request_handle
+        self.request_evidence = dict(request_evidence or {})
 
 
 def _strip_skill_atom(raw: str) -> str:
@@ -88,6 +118,47 @@ def _request_definitely_not_sent(exc: BaseException) -> bool:
     result = getattr(exc, "result", None)
     metadata = getattr(result, "metadata", {})
     return isinstance(metadata, dict) and metadata.get("request_sent") is False
+
+
+def _request_evidence(source: object) -> tuple[RequestHandle | None, dict[str, Any]]:
+    """Return a bounded, credential-free recovery record from a result/error."""
+    result = getattr(source, "result", source)
+    metadata = getattr(result, "metadata", {})
+    if not isinstance(metadata, dict):
+        return None, {}
+    allowed = (
+        "request_state",
+        "outcome",
+        "request_sent",
+        "phase",
+        "maestro_phase",
+        "simulation_start_sent",
+        "session",
+        "completion_marker",
+        "waiting_for_user",
+    )
+    evidence = {key: metadata[key] for key in allowed if key in metadata}
+    handle = None
+    if "request_handle" in metadata:
+        try:
+            handle = RequestHandle.model_validate(metadata["request_handle"])
+        except Exception:
+            evidence["invalid_request_handle"] = True
+        else:
+            evidence["request_handle"] = handle.model_dump()
+    status = getattr(result, "status", None)
+    if status is not None:
+        evidence["status"] = getattr(status, "value", str(status))
+    errors = [str(item) for item in (getattr(result, "errors", None) or [])]
+    warnings = [str(item) for item in (getattr(result, "warnings", None) or [])]
+    if errors:
+        evidence["errors"] = errors[:8]
+    if warnings:
+        evidence["warnings"] = warnings[:8]
+    output = getattr(result, "output", "") or ""
+    if isinstance(output, str) and output:
+        evidence["output"] = output[:4096]
+    return handle, evidence
 
 
 class MaestroJobManager:
@@ -108,6 +179,10 @@ class MaestroJobManager:
         profile: str | None = None,
         client: object | None = None,
         owns_runner: bool = False,
+        gui_host: str | None = None,
+        observed_gui_host: str | None = None,
+        account: str | None = None,
+        local_gui_authorized: bool = False,
     ) -> None:
         if transport == "ssh" and runner is None:
             raise ValueError("SSH Maestro jobs require a runner")
@@ -120,11 +195,69 @@ class MaestroJobManager:
         self._profile = profile
         self._client = client
         self._owns_runner = owns_runner
+        self._local_gui_authorized = local_gui_authorized
+        if transport == "ssh":
+            gui_host = gui_host or getattr(runner, "host", None)
+            observed_gui_host = observed_gui_host or gui_host
+            account = account or getattr(runner, "user", None)
+            if not gui_host or not observed_gui_host or not account:
+                raise ValueError(
+                    "SSH Maestro jobs require a resolved GUI host and account identity"
+                )
+        else:
+            gui_host = gui_host or socket.gethostname()
+            observed_gui_host = observed_gui_host or gui_host
+            account = account or getuser()
+        self._endpoint = MaestroJobEndpoint(
+            transport=transport,
+            configured_gui_host=self._identity_text(gui_host, "configured GUI host"),
+            observed_gui_host=self._identity_text(
+                observed_gui_host, "observed GUI host"
+            ),
+            account=self._identity_text(account, "account"),
+            namespace=self._work_root,
+        )
 
     @property
     def local_root(self) -> Path:
         """Directory containing durable local job manifests."""
         return self._local_root
+
+    @staticmethod
+    def _identity_text(value: object, label: str) -> str:
+        text = str(value or "").strip()
+        if not text or any(character in text for character in "\x00\r\n"):
+            raise ValueError(f"{label} identity must be nonempty and contain no controls")
+        return text
+
+    @staticmethod
+    def _probe_ssh_identity(runner: SSHRunner) -> tuple[str, str]:
+        result = runner.run_command(
+            "host=$(hostname -f 2>/dev/null || hostname 2>/dev/null) && "
+            "account=$(id -un 2>/dev/null || whoami 2>/dev/null) && "
+            "printf 'host=%s\\naccount=%s\\n' \"$host\" \"$account\"",
+            timeout=10,
+        )
+        if result.returncode:
+            MaestroJobManager._raise_remote_error(
+                result, "resolve Maestro GUI host identity"
+            )
+        values = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        return (
+            MaestroJobManager._identity_text(values.get("host"), "observed GUI host"),
+            MaestroJobManager._identity_text(values.get("account"), "remote account"),
+        )
+
+    def _endpoint_dict(self) -> dict[str, str]:
+        return {
+            "transport": self._endpoint.transport,
+            "configured_gui_host": self._endpoint.configured_gui_host,
+            "observed_gui_host": self._endpoint.observed_gui_host,
+            "account": self._endpoint.account,
+            "namespace": self._endpoint.namespace,
+        }
 
     @classmethod
     def from_env(
@@ -158,6 +291,7 @@ class MaestroJobManager:
             configured_user=roles.remote_user or runner.user,
             runner=runner,
         )
+        observed_host, observed_account = cls._probe_ssh_identity(runner)
         root = remote_root or default_virtuoso_bridge_dir(
             username, "maestro-jobs", resolve_client_id(profile)
         )
@@ -168,6 +302,9 @@ class MaestroJobManager:
             local_root=local_root,
             profile=profile,
             owns_runner=True,
+            gui_host=roles.gui_host,
+            observed_gui_host=observed_host,
+            account=observed_account,
         )
 
     @classmethod
@@ -194,17 +331,28 @@ class MaestroJobManager:
         remote_root: str | None = None,
         local_work_root: Path | None = None,
         profile: str | None = None,
+        local_gui: bool = False,
     ) -> "MaestroJobManager":
         """Create a submission manager bound to an already selected CIW."""
+        if not isinstance(local_gui, bool):
+            raise ValueError("local_gui must be an explicit boolean")
         runner = getattr(client, "gui_runner", None)
         if runner is None:
+            if not local_gui:
+                raise ValueError(
+                    "No GUI SSH transport is attached. Pass local_gui=True only for "
+                    "a genuinely local Virtuoso GUI, not a forwarded TCP endpoint."
+                )
             return cls(
                 None,
                 work_root=local_work_root or tmp_dir("maestro-jobs"),
                 transport="local",
                 local_root=local_root,
                 client=client,
+                local_gui_authorized=True,
             )
+        if local_gui:
+            raise ValueError("local_gui=True conflicts with the attached GUI SSH transport")
 
         tunnel = getattr(client, "_tunnel", None)
         connected_profile = getattr(tunnel, "_profile", None)
@@ -222,6 +370,7 @@ class MaestroJobManager:
             configured_user=roles.remote_user or getattr(runner, "user", None),
             runner=runner,
         )
+        observed_host, observed_account = cls._probe_ssh_identity(runner)
         root = remote_root or default_virtuoso_bridge_dir(
             username, "maestro-jobs", resolve_client_id(profile)
         )
@@ -232,6 +381,9 @@ class MaestroJobManager:
             local_root=local_root,
             profile=profile,
             client=client,
+            gui_host=getattr(runner, "host", None) or roles.gui_host,
+            observed_gui_host=observed_host,
+            account=observed_account,
         )
 
     def submit(
@@ -261,19 +413,23 @@ class MaestroJobManager:
         local_dir.mkdir(parents=True, exist_ok=False)
 
         manifest: dict[str, Any] = {
-            "schema": 1,
+            "schema": _MANIFEST_SCHEMA,
             "kind": "maestro-simulation",
             "run_id": run_id,
             "transport": self._transport,
             "profile": self._profile,
+            "endpoint": self._endpoint_dict(),
             "session": session,
             "run_mode": run_mode,
             "created_at": time.time(),
             "phase": "preparing",
             "history": None,
             "virtuoso_pid": None,
+            "process_start": None,
             "target": {},
             "work_dir": work_dir,
+            "request_handle": None,
+            "request_evidence": {},
             "diagnostics": [],
         }
         self._write_manifest(local_dir, manifest)
@@ -282,7 +438,7 @@ class MaestroJobManager:
         except Exception as exc:
             message = f"reserve Maestro job directory failed: {exc}"
             persistence = self._record_outcome(
-                local_dir, work_dir, manifest, "failed", message
+                local_dir, work_dir, manifest, "failed", message, persist_work=False
             )
             message = self._with_persistence_errors(message, persistence)
             raise MaestroJobSubmissionError(message, run_id=run_id, state="failed") from exc
@@ -298,7 +454,8 @@ class MaestroJobManager:
             )
             if getattr(guard, "status", None) != "clear":
                 raise RuntimeError(
-                    "connected CIW has a blocking or indeterminate dialog; simulation was not started"
+                    "connected CIW has a blocking or indeterminate dialog; "
+                    "simulation was not started"
                 )
             target = getattr(guard, "target", None)
             pid = getattr(target, "pid", None)
@@ -316,6 +473,12 @@ class MaestroJobManager:
                     f"(access={getattr(state, 'access', 'unknown')})"
                 )
             manifest["virtuoso_pid"] = pid
+            process_start = self._process_start_identity(pid)
+            if not process_start:
+                raise RuntimeError(
+                    "could not bind the verified Virtuoso PID to a process instance"
+                )
+            manifest["process_start"] = process_start
             manifest["target"] = {
                 "library": getattr(state, "lib", None),
                 "cell": getattr(state, "cell", None),
@@ -325,6 +488,12 @@ class MaestroJobManager:
             }
             self._write_manifest(local_dir, manifest)
             self._persist_text(work_dir, "virtuoso.pid", f"{pid}\n", required=True)
+            self._persist_text(
+                work_dir,
+                "virtuoso.process_start",
+                f"{process_start}\n",
+                required=True,
+            )
             self._persist_work_manifest(work_dir, manifest, required=True)
             callback_name = f"_vb_maestro_job_{uuid.uuid4().hex[:12]}"
             callback_result = client.execute_skill(
@@ -336,7 +505,7 @@ class MaestroJobManager:
         except Exception as exc:
             message = f"Maestro preflight failed before simulation start: {exc}"
             persistence = self._record_outcome(
-                local_dir, work_dir, manifest, "failed", message
+                local_dir, work_dir, manifest, "failed", message, persist_work=True
             )
             message = self._with_persistence_errors(message, persistence)
             raise MaestroJobSubmissionError(message, run_id=run_id, state="failed") from exc
@@ -351,15 +520,26 @@ class MaestroJobManager:
             )
         except Exception as exc:
             outcome = "failed" if _request_definitely_not_sent(exc) else "unknown"
+            request_handle, evidence = _request_evidence(exc)
+            manifest["request_handle"] = (
+                request_handle.model_dump() if request_handle is not None else None
+            )
+            manifest["request_evidence"] = evidence
             message = (
                 "Maestro start was not acknowledged; the request was not repeated. "
                 f"Verify this job by status before any new submission: {exc}"
             )
             persistence = self._record_outcome(
-                local_dir, work_dir, manifest, outcome, message
+                local_dir, work_dir, manifest, outcome, message, persist_work=True
             )
             message = self._with_persistence_errors(message, persistence)
-            raise MaestroJobSubmissionError(message, run_id=run_id, state=outcome) from exc
+            raise MaestroJobSubmissionError(
+                message,
+                run_id=run_id,
+                state=outcome,
+                request_handle=request_handle,
+                request_evidence=evidence,
+            ) from exc
 
         history = _strip_skill_atom(raw_history)
         if not history or history == "nil":
@@ -367,7 +547,7 @@ class MaestroJobManager:
                 "maeRunSimulation returned no history acknowledgement; the request was not repeated"
             )
             persistence = self._record_outcome(
-                local_dir, work_dir, manifest, "unknown", message
+                local_dir, work_dir, manifest, "unknown", message, persist_work=True
             )
             message = self._with_persistence_errors(message, persistence)
             raise MaestroJobSubmissionError(message, run_id=run_id, state="unknown")
@@ -393,15 +573,15 @@ class MaestroJobManager:
                 f"any new submission: {exc}"
             )
             persistence = self._record_outcome(
-                local_dir, work_dir, manifest, "unknown", message
+                local_dir, work_dir, manifest, "unknown", message, persist_work=True
             )
             message = self._with_persistence_errors(message, persistence)
             raise MaestroJobSubmissionError(
                 message, run_id=run_id, state="unknown"
             ) from exc
 
-    def load(self, run_id: str) -> MaestroJob:
-        """Reattach to a job from its local manifest."""
+    def load(self, run_id: str, *, migrate_legacy: bool = False) -> MaestroJob:
+        """Reattach to a job, requiring explicit migration of schema-1 handles."""
         run_id = run_id.lower()
         self._validate_run_id(run_id)
         local_dir = self._local_root / run_id
@@ -411,9 +591,53 @@ class MaestroJobManager:
             raise FileNotFoundError(f"No local manifest for Maestro job {run_id}") from exc
         if manifest.get("run_id") != run_id or manifest.get("kind") != "maestro-simulation":
             raise RuntimeError(f"Invalid Maestro manifest for {run_id}")
+        schema = manifest.get("schema")
+        if schema == 1 and migrate_legacy:
+            manifest = self._migrate_legacy_manifest(local_dir, manifest)
+        elif schema != _MANIFEST_SCHEMA:
+            suffix = (
+                "; pass migrate_legacy=True to bind this schema-1 handle to the "
+                "current endpoint explicitly"
+                if schema == 1
+                else ""
+            )
+            raise RuntimeError(
+                f"Unsupported Maestro manifest schema for {run_id}: {schema!r}{suffix}"
+            )
         transport = manifest.get("transport")
         if transport not in ("ssh", "local"):
             raise RuntimeError(f"Invalid Maestro transport for {run_id}: {transport!r}")
+        endpoint_raw = manifest.get("endpoint")
+        if not isinstance(endpoint_raw, dict):
+            raise RuntimeError(f"Maestro manifest {run_id} has no endpoint identity")
+        try:
+            endpoint = MaestroJobEndpoint(
+                transport=endpoint_raw["transport"],
+                configured_gui_host=self._identity_text(
+                    endpoint_raw["configured_gui_host"], "configured GUI host"
+                ),
+                observed_gui_host=self._identity_text(
+                    endpoint_raw["observed_gui_host"], "observed GUI host"
+                ),
+                account=self._identity_text(endpoint_raw["account"], "account"),
+                namespace=str(endpoint_raw["namespace"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Maestro manifest {run_id} has an invalid endpoint identity"
+            ) from exc
+        if endpoint.transport != transport:
+            raise RuntimeError(
+                f"Maestro manifest {run_id} endpoint transport is inconsistent"
+            )
+        request_handle = None
+        if manifest.get("request_handle") is not None:
+            try:
+                request_handle = RequestHandle.model_validate(manifest["request_handle"])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Maestro manifest {run_id} has an invalid request handle"
+                ) from exc
         return MaestroJob(
             run_id=run_id,
             work_dir=str(manifest["work_dir"]),
@@ -423,7 +647,11 @@ class MaestroJobManager:
             session=str(manifest["session"]),
             history=manifest.get("history"),
             virtuoso_pid=manifest.get("virtuoso_pid"),
+            process_start=manifest.get("process_start"),
             target=dict(manifest.get("target") or {}),
+            endpoint=endpoint,
+            request_handle=request_handle,
+            request_evidence=dict(manifest.get("request_evidence") or {}),
         )
 
     def list(self) -> list[MaestroJob]:
@@ -448,37 +676,105 @@ class MaestroJobManager:
                 continue
         return [job for _, job in sorted(jobs, key=lambda item: item[0], reverse=True)]
 
+    def reconcile(
+        self,
+        job: MaestroJob,
+        *,
+        client: object | None = None,
+        timeout: float = 10,
+        local_gui: bool = False,
+    ) -> MaestroJob:
+        """Query the original request receipt without resubmitting the run."""
+        self._validate_job(job)
+        if isinstance(timeout, bool) or timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError("timeout must be positive and finite")
+        client = client or self._client
+        if client is None:
+            raise ValueError("reconcile requires the original endpoint's VirtuosoClient")
+        self._validate_recovery_client(
+            client,
+            job,
+            local_gui=local_gui or self._local_gui_authorized,
+        )
+        if job.request_handle is None:
+            raise ValueError("job has no recoverable request handle")
+
+        result = client.requests.receipt(job.request_handle, timeout=timeout)
+        returned_handle, evidence = _request_evidence(result)
+        if returned_handle != job.request_handle:
+            raise RuntimeError("receipt did not preserve the original request handle")
+        manifest = json.loads(
+            (job.local_dir / "manifest.json").read_text(encoding="utf-8")
+        )
+        manifest["request_handle"] = job.request_handle.model_dump()
+        manifest["request_evidence"] = evidence
+        manifest["reconciled_at"] = time.time()
+        history = _strip_skill_atom(getattr(result, "output", "") or "")
+        if getattr(result, "ok", False) and history and history != "nil":
+            manifest["phase"] = "submitted"
+            manifest["history"] = history
+            event = f"reconciled {history}"
+        elif evidence.get("request_sent") is False:
+            manifest["phase"] = "failed"
+            event = "reconciled not-started"
+        else:
+            manifest["phase"] = "unknown"
+            event = "reconciled unknown"
+        self._write_manifest(job.local_dir, manifest)
+        try:
+            self._append_event(job.work_dir, event)
+        except Exception as exc:
+            manifest.setdefault("diagnostics", []).append(
+                f"could not append reconciliation lifecycle event: {exc}"
+            )
+            self._write_manifest(job.local_dir, manifest)
+        self._persist_work_manifest(job.work_dir, manifest, required=False)
+        return self.load(job.run_id)
+
     def status(self, job: MaestroJob) -> MaestroJobStatus:
         """Inspect one job without sending SKILL to the CIW."""
         self._validate_job(job)
         manifest = json.loads((job.local_dir / "manifest.json").read_text(encoding="utf-8"))
         phase = str(manifest.get("phase", "unknown"))
-        diagnostics = tuple(str(item) for item in manifest.get("diagnostics", []))
+        diagnostic_items = [str(item) for item in manifest.get("diagnostics", [])]
         if phase == "failed":
-            return self._status(job, "failed", None, diagnostics)
+            return self._status(job, "failed", None, tuple(diagnostic_items))
 
         observed = self._observe_work_dir(job.work_dir)
         completion = observed.get("marker") or None
         pid_text = observed.get("pid", "")
         observed_pid = int(pid_text) if _PID.fullmatch(pid_text) else job.virtuoso_pid
+        observed_history = _strip_skill_atom(observed.get("callback_history", ""))
+        observed_session = _strip_skill_atom(observed.get("callback_session", ""))
+        callback_matches = (
+            observed_session == job.session
+            and bool(observed_history)
+            and (job.history is None or observed_history == job.history)
+        )
         if observed.get("exists") != "1":
             state = "missing"
-        elif observed.get("completed") == "1":
+        elif observed.get("completed") == "1" and callback_matches:
             state = "completed"
-        elif phase == "submitted" and observed.get("alive") == "1":
+        elif observed.get("completed") == "1":
+            state = "unknown"
+            diagnostic_items.append(
+                "completion callback session/history did not match the submitted job"
+            )
+        elif phase == "submitted" and observed.get("process_match") == "1":
             state = "running"
         else:
             state = "unknown"
         return MaestroJobStatus(
             run_id=job.run_id,
             state=state,
-            history=job.history,
+            history=job.history or observed_history or None,
             session=job.session,
             work_dir=job.work_dir,
             transport=job.transport,
             virtuoso_pid=observed_pid,
+            process_start=job.process_start,
             completion=completion,
-            diagnostics=diagnostics,
+            diagnostics=tuple(diagnostic_items),
         )
 
     def log(self, job: MaestroJob, *, lines: int = 80) -> str:
@@ -592,34 +888,140 @@ class MaestroJobManager:
             path = Path(work_dir)
             marker_path = path / "completed"
             pid_path = path / "virtuoso.pid"
+            start_path = path / "virtuoso.process_start"
             marker = ""
+            callback_session = ""
+            callback_history = ""
             if marker_path.is_file() and marker_path.stat().st_size:
-                marker = marker_path.read_text(encoding="utf-8").splitlines()[0]
+                marker_lines = marker_path.read_text(encoding="utf-8").splitlines()
+                marker = marker_lines[0]
+                for line in marker_lines[1:]:
+                    if line.startswith("session="):
+                        callback_session = line.removeprefix("session=")
+                    elif line.startswith("history="):
+                        callback_history = line.removeprefix("history=")
             pid = pid_path.read_text(encoding="utf-8").strip() if pid_path.is_file() else ""
-            alive = "1" if _PID.fullmatch(pid) and self._pid_alive(int(pid)) else "0"
+            process_start = (
+                start_path.read_text(encoding="utf-8").strip()
+                if start_path.is_file()
+                else ""
+            )
+            current_start = (
+                self._process_start_identity(int(pid)) if _PID.fullmatch(pid) else None
+            )
+            process_match = bool(process_start and current_start == process_start)
             return {
                 "exists": "1" if path.is_dir() else "0",
                 "completed": "1" if marker else "0",
-                "alive": alive,
+                "alive": "1" if current_start else "0",
+                "process_match": "1" if process_match else "0",
+                "process_start": process_start,
                 "marker": marker,
+                "callback_session": callback_session,
+                "callback_history": callback_history,
                 "pid": pid,
             }
 
         assert self._runner is not None
         command = (
-            f"d={shlex.quote(work_dir)}; exists=0; completed=0; alive=0; marker=; pid=; "
+            f"d={shlex.quote(work_dir)}; exists=0; completed=0; alive=0; "
+            "process_match=0; marker=; callback_session=; callback_history=; "
+            "pid=; expected_start=; current_start=; "
             "if test -d \"$d\"; then exists=1; fi; "
-            "if test -s \"$d/completed\"; then completed=1; marker=$(head -n 1 \"$d/completed\"); fi; "
+            "if test -s \"$d/completed\"; then completed=1; "
+            "marker=$(sed -n '1p' \"$d/completed\"); "
+            "callback_session=$(sed -n '2s/^session=//p' \"$d/completed\"); "
+            "callback_history=$(sed -n '3s/^history=//p' \"$d/completed\"); fi; "
             "if test -r \"$d/virtuoso.pid\"; then pid=$(cat \"$d/virtuoso.pid\"); fi; "
+            "if test -r \"$d/virtuoso.process_start\"; then "
+            "expected_start=$(cat \"$d/virtuoso.process_start\"); fi; "
             "case \"$pid\" in ''|*[!0-9]*) alive=0;; "
-            "*) if test \"$pid\" -gt 0 2>/dev/null && kill -0 \"$pid\" 2>/dev/null; then alive=1; fi;; esac; "
-            "printf 'exists=%s\\ncompleted=%s\\nalive=%s\\nmarker=%s\\npid=%s\\n' "
-            "\"$exists\" \"$completed\" \"$alive\" \"$marker\" \"$pid\""
+            "*) if test \"$pid\" -gt 0 2>/dev/null && kill -0 \"$pid\" 2>/dev/null; then "
+            "alive=1; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null || true); "
+            "rest=${stat#*) }; set -- $rest; "
+            "if test $# -ge 20; then current_start=linux:${20}; fi; "
+            "if test -n \"$expected_start\" && "
+            "test \"$current_start\" = \"$expected_start\"; then process_match=1; fi; "
+            "fi;; esac; "
+            "printf 'exists=%s\\ncompleted=%s\\nalive=%s\\nprocess_match=%s\\n"
+            "process_start=%s\\nmarker=%s\\ncallback_session=%s\\n"
+            "callback_history=%s\\npid=%s\\n' "
+            "\"$exists\" \"$completed\" \"$alive\" \"$process_match\" \"$expected_start\" "
+            "\"$marker\" \"$callback_session\" \"$callback_history\" \"$pid\""
         )
         result = self._runner.run_command(command)
         if result.returncode:
             self._raise_remote_error(result, "query Maestro job status")
         return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    def _process_start_identity(self, pid: int) -> str | None:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return None
+        if self._transport == "ssh":
+            assert self._runner is not None
+            result = self._runner.run_command(
+                f"cat /proc/{pid}/stat 2>/dev/null", timeout=10
+            )
+            if result.returncode:
+                return None
+            return self._linux_process_start(result.stdout)
+        if os.name == "nt":
+            return self._windows_process_start(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return self._linux_process_start(stat)
+
+    @staticmethod
+    def _linux_process_start(stat: str) -> str | None:
+        _prefix, separator, tail = stat.strip().rpartition(") ")
+        if not separator:
+            return None
+        fields = tail.split()
+        if len(fields) < 20 or not fields[19].isdigit():
+            return None
+        return f"linux:{fields[19]}"
+
+    @staticmethod
+    def _windows_process_start(pid: int) -> str | None:
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            ticks = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return f"windows:{ticks}"
+        finally:
+            kernel32.CloseHandle(handle)
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
@@ -666,6 +1068,61 @@ class MaestroJobManager:
         if not _RUN_ID.fullmatch(run_id):
             raise ValueError("run_id must use lowercase letters, digits, and hyphens")
 
+    def _migrate_legacy_manifest(
+        self, local_dir: Path, manifest: dict[str, Any]
+    ) -> dict[str, Any]:
+        run_id = str(manifest.get("run_id") or "")
+        transport = manifest.get("transport")
+        if transport != self._transport:
+            raise ValueError("legacy job transport does not match this manager")
+        if transport == "ssh" and manifest.get("profile") != self._profile:
+            raise ValueError("legacy job profile does not match this manager")
+        if str(manifest.get("work_dir")) != self._job_work_dir(run_id):
+            raise ValueError("legacy job namespace does not match this manager")
+        migrated = dict(manifest)
+        migrated.update(
+            schema=_MANIFEST_SCHEMA,
+            endpoint=self._endpoint_dict(),
+            process_start=None,
+            request_handle=None,
+            request_evidence={},
+            migrated_at=time.time(),
+        )
+        migrated.setdefault("diagnostics", []).append(
+            "schema-1 handle explicitly rebound to the selected endpoint; "
+            "PID liveness is not trusted without original process-start evidence"
+        )
+        self._write_manifest(local_dir, migrated)
+        return migrated
+
+    def _validate_recovery_client(
+        self, client: object, job: MaestroJob, *, local_gui: bool
+    ) -> None:
+        runner = getattr(client, "gui_runner", None)
+        if job.transport == "ssh":
+            if local_gui or runner is None:
+                raise ValueError(
+                    "SSH job recovery requires the original GUI SSH transport"
+                )
+            observed_host, account = self._probe_ssh_identity(runner)
+            candidate = MaestroJobEndpoint(
+                transport="ssh",
+                configured_gui_host=self._identity_text(
+                    getattr(runner, "host", None), "configured GUI host"
+                ),
+                observed_gui_host=observed_host,
+                account=account,
+                namespace=self._work_root,
+            )
+        else:
+            if runner is not None or not local_gui:
+                raise ValueError(
+                    "local job recovery requires explicit local_gui=True and no GUI SSH transport"
+                )
+            candidate = self._endpoint
+        if candidate != job.endpoint:
+            raise ValueError("recovery client endpoint identity does not match the job")
+
     def _validate_job(self, job: MaestroJob) -> None:
         self._validate_run_id(job.run_id)
         if job.local_dir.name != job.run_id:
@@ -678,6 +1135,12 @@ class MaestroJobManager:
             raise ValueError(
                 f"job profile {job.profile!r} does not match manager {self._profile!r}"
             )
+        if job.endpoint != self._endpoint:
+            raise ValueError(
+                "job GUI host/account/namespace identity does not match this manager"
+            )
+        if job.work_dir != self._job_work_dir(job.run_id):
+            raise ValueError("job work directory does not match the manager namespace")
 
     @staticmethod
     def _write_manifest(local_dir: Path, manifest: dict[str, Any]) -> None:
@@ -705,6 +1168,8 @@ class MaestroJobManager:
         manifest: dict[str, Any],
         phase: str,
         diagnostic: str,
+        *,
+        persist_work: bool,
     ) -> list[str]:
         manifest["phase"] = phase
         manifest.setdefault("diagnostics", []).append(diagnostic)
@@ -714,10 +1179,11 @@ class MaestroJobManager:
             self._write_manifest(local_dir, manifest)
         except Exception as exc:
             errors.append(f"local manifest: {exc}")
-        try:
-            self._persist_work_manifest(work_dir, manifest, required=False)
-        except Exception as exc:
-            errors.append(f"work manifest: {exc}")
+        if persist_work:
+            try:
+                self._persist_work_manifest(work_dir, manifest, required=False)
+            except Exception as exc:
+                errors.append(f"work manifest: {exc}")
         return errors
 
     @staticmethod
@@ -732,7 +1198,6 @@ class MaestroJobManager:
         temporary = marker + ".tmp"
         events = work_dir.rstrip("/") + "/events.log"
         shell = (
-            f"printf 'completed\\n' > {shlex.quote(temporary)} && "
             f"mv {shlex.quote(temporary)} {shlex.quote(marker)} && "
             f"printf 'completed %s\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> "
             f"{shlex.quote(events)}"
@@ -740,7 +1205,14 @@ class MaestroJobManager:
         command = "sh -c " + shlex.quote(shell)
         return (
             f"procedure({name}(session runID)\n"
-            f'  system("{escape_skill_string(command)}")\n'
+            "  let((vbJobPort)\n"
+            f'    vbJobPort=outfile("{escape_skill_string(temporary)}")\n'
+            "    when(vbJobPort\n"
+            '      fprintf(vbJobPort "completed\\nsession=%L\\nhistory=%L\\n" session runID)\n'
+            "      close(vbJobPort)\n"
+            f'      system("{escape_skill_string(command)}")\n'
+            "    )\n"
+            "  )\n"
             "  t\n"
             ")"
         )
@@ -760,6 +1232,7 @@ class MaestroJobManager:
             work_dir=job.work_dir,
             transport=job.transport,
             virtuoso_pid=job.virtuoso_pid,
+            process_start=job.process_start,
             completion=completion,
             diagnostics=diagnostics,
         )

@@ -526,17 +526,47 @@ with MaestroJobManager.from_env(local_root=root, profile="lab") as jobs:
     print(status.state, status.history)
 ```
 
-For a locally running Virtuoso process, create the submit manager with
-`from_client()` as usual and later use `MaestroJobManager.local()` to observe
-the saved handle.
+For a genuinely local Virtuoso GUI, explicitly authorize the local filesystem
+transport. A loopback TCP endpoint alone is not proof that the GUI is local:
+
+```python
+jobs = MaestroJobManager.from_client(
+    client,
+    local_gui=True,
+    local_root=root,
+)
+```
+
+Later use `MaestroJobManager.local()` to observe that saved handle. Do not pass
+`local_gui=True` for an SSH-forwarded or otherwise remote TCP endpoint.
 
 Submission requires an exact Maestro GUI session in Editing mode and enables
 the shared-CIW dialog guard with recoverable in-flight requests. If start
 acknowledgement is lost, `MaestroJobSubmissionError.state` is `unknown` and the
 exception retains the generated `run_id`; the start request is never repeated.
-Query that run id before deciding whether a new simulation is safe. Managers
-also reject a profile that differs from the connected client so a handle cannot
-silently point at the wrong GUI host.
+The manifest also retains the authenticated request handle when one was issued.
+A later process can reconcile the original receipt without submitting another
+run:
+
+```python
+client = VirtuosoClient.from_env(profile="lab")
+with MaestroJobManager.from_env(local_root=root, profile="lab") as jobs:
+    job = jobs.load("long-tran-001")
+    if job.request_handle is not None:
+        job = jobs.reconcile(job, client=client)
+```
+
+Receipt recovery is bounded by the daemon's retention and identity. An expired
+receipt, daemon restart, changed endpoint, or unverifiable result remains
+`unknown`; it is never treated as permission to repeat `maeRunSimulation`.
+
+Durable handles bind the configured and observed GUI host, remote account, job
+namespace, Virtuoso PID, and process start identity. `status()`, `log()`, and
+`reconcile()` reject host, account, or namespace drift before reading remote
+files. Profile names are labels, not transport identity. Schema-1 development
+manifests are rejected by default; `load(run_id, migrate_legacy=True)` is the
+explicit opt-in for binding one to the currently selected endpoint. Migrated
+handles do not use PID liveness without original process-start evidence.
 
 `status().state` is one of `running`, `completed`, `failed`, `missing`, or
 `unknown`. These are observations rather than a monotonic state machine:
