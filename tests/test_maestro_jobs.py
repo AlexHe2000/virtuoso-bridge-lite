@@ -17,6 +17,7 @@ from virtuoso_bridge.virtuoso.maestro import (
 )
 from virtuoso_bridge.virtuoso.maestro import jobs as maestro_jobs
 from virtuoso_bridge.virtuoso.requests import RequestHandle, RequestRecoveryError
+from virtuoso_bridge.virtuoso.maestro.reader.state import get_session_state
 
 
 class Result:
@@ -789,9 +790,8 @@ def test_pending_preflight_receipt_is_retained_without_becoming_run_history(tmp_
                   "outcome": "unknown", "request_sent": True},
     )
     if phase == "session_state":
-        def uncertain_state(**kwargs):
-            raise RequestRecoveryError(pending)
-        client.maestro.get_session_state = uncertain_state
+        client.execute_skill = lambda *args, **kwargs: pending
+        client.maestro.get_session_state = lambda **kwargs: get_session_state(client, **kwargs)
     else:
         client.execute_skill = lambda *args, **kwargs: pending
     manager = remote_manager(tmp_path, runner, client)
