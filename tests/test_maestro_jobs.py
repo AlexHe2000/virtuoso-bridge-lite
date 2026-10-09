@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -372,7 +373,17 @@ def test_log_is_explicitly_lifecycle_only(tmp_path) -> None:
     assert "/events.log" in runner.commands[-1]
 
 
-def test_local_transport_submits_and_observes_completion_without_ssh(tmp_path) -> None:
+@pytest.fixture
+def portable_local_process_identity(monkeypatch):
+    if os.name != "nt" and not Path("/proc/self/stat").is_file():
+        # These test filesystem/authorization behavior, not a native Cadence process.
+        monkeypatch.setattr(MaestroJobManager, "_process_start_identity",
+                            lambda self, pid: f"fixture:{pid}")
+
+
+def test_local_transport_submits_and_observes_completion_without_ssh(
+    tmp_path, portable_local_process_identity
+) -> None:
     client = FakeClient()
     jobs = MaestroJobManager.from_client(
         client,
@@ -414,7 +425,9 @@ def test_from_client_rejects_profile_different_from_connected_tunnel(tmp_path) -
         )
 
 
-def test_from_client_requires_explicit_local_gui_authorization(tmp_path) -> None:
+def test_from_client_requires_explicit_local_gui_authorization(
+    tmp_path, portable_local_process_identity
+) -> None:
     forwarded_client = FakeClient()
 
     with pytest.raises(ValueError, match="local_gui=True"):
@@ -722,3 +735,93 @@ def test_real_shell_conflict_preserves_existing_remote_job(tmp_path) -> None:
     assert observed["completed"] == "1"
     assert observed["callback_session"] == "fnxSession4"
     assert observed["callback_history"] == "Interactive.7"
+
+
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("pid,start", [(9999, "linux:999"), (4242, "linux:888")])
+def test_observed_process_must_match_durable_job(tmp_path, completed, pid, start):
+    runner = RecordingRunner()
+    manager = remote_manager(tmp_path, runner, FakeClient(runner))
+    job = manager.submit(session="fnxSession4", run_id="durable-instance-001")
+    runner.status_output = (
+        f"exists=1\ncompleted={int(completed)}\nalive=1\nprocess_match=1\n"
+        f"process_start={start}\nmarker={'completed' if completed else ''}\n"
+        f"callback_session=fnxSession4\ncallback_history=Interactive.7\npid={pid}\n"
+    )
+    assert manager.status(job).state == "unknown"
+
+
+def test_missing_original_process_identity_cannot_report_running(tmp_path):
+    runner = RecordingRunner()
+    manager = remote_manager(tmp_path, runner, FakeClient(runner))
+    job = manager.submit(session="fnxSession4", run_id="missing-instance-001")
+    assert manager.status(replace(job, process_start=None)).state == "unknown"
+
+
+@pytest.mark.parametrize("method", ["status", "log"])
+def test_same_manager_reconnect_identity_is_checked_before_file_read(tmp_path, method):
+    runner = RecordingRunner()
+    manager = remote_manager(tmp_path, runner, FakeClient(runner))
+    job = manager.submit(session="fnxSession4", run_id="reconnect-identity-001")
+    original = runner.run_command
+    reads = []
+
+    def reconnected(command, **kwargs):
+        if command.startswith("host=$(hostname"):
+            return Result(stdout="host=other-real-gui\naccount=designer\n")
+        reads.append(command)
+        return original(command, **kwargs)
+
+    runner.run_command = reconnected
+    with pytest.raises(ValueError, match="identity"):
+        getattr(manager, method)(job)
+    assert reads == []
+
+
+@pytest.mark.parametrize("phase", ["session_state", "callback_setup"])
+def test_pending_preflight_receipt_is_retained_without_becoming_run_history(tmp_path, phase):
+    runner = RecordingRunner()
+    client = FakeClient(runner)
+    handle = RequestHandle(request_id="c" * 32, daemon_instance="d" * 32, virtuoso_pid=4242)
+    pending = VirtuosoResult(
+        status=ExecutionStatus.ERROR, errors=["preflight request still running"],
+        metadata={"request_handle": handle.model_dump(), "request_state": "running",
+                  "outcome": "unknown", "request_sent": True},
+    )
+    if phase == "session_state":
+        def uncertain_state(**kwargs):
+            raise RequestRecoveryError(pending)
+        client.maestro.get_session_state = uncertain_state
+    else:
+        client.execute_skill = lambda *args, **kwargs: pending
+    manager = remote_manager(tmp_path, runner, client)
+    with pytest.raises(MaestroJobSubmissionError) as caught:
+        manager.submit(session="fnxSession4", run_id="preflight-receipt-001")
+    assert caught.value.state == "unknown"
+    assert caught.value.request_handle == handle
+    assert client.maestro.run_calls == 0
+    job = manager.load("preflight-receipt-001")
+    assert job.request_handle == handle
+    assert job.request_evidence["maestro_phase"] == phase
+    client.requests.result = pending
+    still_pending = manager.reconcile(job, client=client)
+    assert still_pending.request_evidence["maestro_phase"] == phase
+    assert manager.status(still_pending).state == "unknown"
+    assert client.maestro.run_calls == 0
+    client.requests.result = VirtuosoResult(
+        status=ExecutionStatus.SUCCESS, output="t",
+        metadata={"request_handle": handle.model_dump(), "request_state": "completed",
+                  "outcome": "completed", "request_sent": True},
+    )
+    reconciled = manager.reconcile(still_pending, client=client)
+    assert reconciled.history is None
+    assert manager.status(reconciled).state == "failed"
+    assert client.maestro.run_calls == 0
+
+
+@pytest.mark.skipif(os.name != "nt" and not Path("/proc/self/stat").is_file(),
+                    reason="requires native Windows or Linux process identity")
+def test_native_current_process_start_identity(tmp_path):
+    manager = MaestroJobManager.local(local_root=tmp_path / "local")
+    identity = manager._process_start_identity(os.getpid())
+    assert identity and identity.startswith("windows:" if os.name == "nt" else "linux:")

@@ -545,11 +545,14 @@ the shared-CIW dialog guard with recoverable in-flight requests. If start
 acknowledgement is lost, `MaestroJobSubmissionError.state` is `unknown` and the
 exception retains the generated `run_id`; the start request is never repeated.
 The manifest also retains the authenticated request handle when one was issued.
-A later process can reconcile the original receipt without submitting another
-run:
+Reuse the existing authenticated client for receipt recovery. In another process,
+reconstruct a receipt-only client from the original reachable endpoint and secured
+credential, as described in [shared-CIW recovery](shared-ciw-dialogs.md).
+Ordinary `from_env()`/`from_tunnel()` factories may issue SKILL identity probes;
+they are not a blocked-CIW recovery path. With the receipt-only `client` already
+available, reconcile without submitting another run:
 
 ```python
-client = VirtuosoClient.from_env(profile="lab")
 with MaestroJobManager.from_env(local_root=root, profile="lab") as jobs:
     job = jobs.load("long-tran-001")
     if job.request_handle is not None:
@@ -559,6 +562,10 @@ with MaestroJobManager.from_env(local_root=root, profile="lab") as jobs:
 Receipt recovery is bounded by the daemon's retention and identity. An expired
 receipt, daemon restart, changed endpoint, or unverifiable result remains
 `unknown`; it is never treated as permission to repeat `maeRunSimulation`.
+Preflight session-state/callback-setup receipts are retained too. Reconciliation
+records their original result without resuming submission or interpreting `t`
+as a simulation history. Once that preflight request is settled, the job is
+`failed` because no simulation was started; starting a new job is a separate action.
 
 Durable handles bind the configured and observed GUI host, remote account, job
 namespace, Virtuoso PID, and process start identity. `status()`, `log()`, and

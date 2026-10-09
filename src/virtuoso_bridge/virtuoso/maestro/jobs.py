@@ -445,6 +445,8 @@ class MaestroJobManager:
         self._persist_work_manifest(work_dir, manifest, required=False)
 
         client = self._client
+        preflight_phase = "dialog_guard"
+        preflight_result = None
         try:
             dialogs = getattr(client, "dialogs")
             guard = dialogs.enable_guard(
@@ -461,6 +463,7 @@ class MaestroJobManager:
             pid = getattr(target, "pid", None)
             if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
                 raise RuntimeError("dialog guard did not return a verified Virtuoso PID")
+            preflight_phase = "session_state"
             state = client.maestro.get_session_state(session=session, timeout=min(timeout, 30))
             if getattr(state, "context", None) != "gui":
                 raise RuntimeError(
@@ -496,19 +499,35 @@ class MaestroJobManager:
             )
             self._persist_work_manifest(work_dir, manifest, required=True)
             callback_name = f"_vb_maestro_job_{uuid.uuid4().hex[:12]}"
+            preflight_phase = "callback_setup"
             callback_result = client.execute_skill(
                 self._callback_skill(callback_name, work_dir), timeout=min(timeout, 30)
             )
+            preflight_result = callback_result
             errors = list(getattr(callback_result, "errors", []) or [])
             if errors:
                 raise RuntimeError(f"callback setup failed: {errors[0]}")
         except Exception as exc:
+            handle, evidence = _request_evidence(
+                preflight_result if preflight_result is not None else exc
+            )
+            evidence.update(maestro_phase=preflight_phase, simulation_start_sent=False)
+            manifest["request_handle"] = handle.model_dump() if handle else None
+            manifest["request_evidence"] = evidence
+            outcome = (
+                "unknown" if handle is not None
+                and evidence.get("request_sent") is not False
+                and evidence.get("request_state") != "completed" else "failed"
+            )
             message = f"Maestro preflight failed before simulation start: {exc}"
             persistence = self._record_outcome(
-                local_dir, work_dir, manifest, "failed", message, persist_work=True
+                local_dir, work_dir, manifest, outcome, message, persist_work=True
             )
             message = self._with_persistence_errors(message, persistence)
-            raise MaestroJobSubmissionError(message, run_id=run_id, state="failed") from exc
+            raise MaestroJobSubmissionError(
+                message, run_id=run_id, state=outcome,
+                request_handle=handle, request_evidence=evidence,
+            ) from exc
 
         try:
             # Exactly one non-idempotent start request. Never wrap this in a retry.
@@ -521,6 +540,7 @@ class MaestroJobManager:
         except Exception as exc:
             outcome = "failed" if _request_definitely_not_sent(exc) else "unknown"
             request_handle, evidence = _request_evidence(exc)
+            evidence["maestro_phase"] = "simulation_start"
             manifest["request_handle"] = (
                 request_handle.model_dump() if request_handle is not None else None
             )
@@ -707,10 +727,21 @@ class MaestroJobManager:
             (job.local_dir / "manifest.json").read_text(encoding="utf-8")
         )
         manifest["request_handle"] = job.request_handle.model_dump()
+        request_phase = job.request_evidence.get("maestro_phase", "simulation_start")
+        evidence["maestro_phase"] = request_phase
         manifest["request_evidence"] = evidence
         manifest["reconciled_at"] = time.time()
         history = _strip_skill_atom(getattr(result, "output", "") or "")
-        if getattr(result, "ok", False) and history and history != "nil":
+        if request_phase in ("session_state", "callback_setup"):
+            evidence["simulation_start_sent"] = False
+            settled = (
+                evidence.get("request_state") == "completed"
+                or evidence.get("request_sent") is False
+            )
+            manifest["phase"] = "failed" if settled else "unknown"
+            event = f"reconciled preflight {request_phase}; simulation not started"
+            manifest.setdefault("diagnostics", []).append(event)
+        elif getattr(result, "ok", False) and history and history != "nil":
             manifest["phase"] = "submitted"
             manifest["history"] = history
             event = f"reconciled {history}"
@@ -744,6 +775,12 @@ class MaestroJobManager:
         completion = observed.get("marker") or None
         pid_text = observed.get("pid", "")
         observed_pid = int(pid_text) if _PID.fullmatch(pid_text) else job.virtuoso_pid
+        identity_matches = (
+            bool(job.process_start)
+            and bool(_PID.fullmatch(pid_text))
+            and observed_pid == job.virtuoso_pid
+            and observed.get("process_start") == job.process_start
+        )
         observed_history = _strip_skill_atom(observed.get("callback_history", ""))
         observed_session = _strip_skill_atom(observed.get("callback_session", ""))
         callback_matches = (
@@ -753,14 +790,15 @@ class MaestroJobManager:
         )
         if observed.get("exists") != "1":
             state = "missing"
-        elif observed.get("completed") == "1" and callback_matches:
+        elif observed.get("completed") == "1" and callback_matches and identity_matches:
             state = "completed"
         elif observed.get("completed") == "1":
             state = "unknown"
             diagnostic_items.append(
-                "completion callback session/history did not match the submitted job"
+                "completion callback or process identity did not match the submitted job"
             )
-        elif phase == "submitted" and observed.get("process_match") == "1":
+        elif (phase == "submitted" and identity_matches
+              and observed.get("process_match") == "1"):
             state = "running"
         else:
             state = "unknown"
@@ -1141,6 +1179,12 @@ class MaestroJobManager:
             )
         if job.work_dir != self._job_work_dir(job.run_id):
             raise ValueError("job work directory does not match the manager namespace")
+        if job.transport == "ssh":
+            assert self._runner is not None
+            host, account = self._probe_ssh_identity(self._runner)
+            if (host != job.endpoint.observed_gui_host
+                    or account != job.endpoint.account):
+                raise ValueError("current SSH host/account identity no longer matches the job")
 
     @staticmethod
     def _write_manifest(local_dir: Path, manifest: dict[str, Any]) -> None:
